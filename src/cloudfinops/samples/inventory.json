@@ -1,0 +1,504 @@
+{
+  "generated_at": "2026-10-15T00:00:00+00:00",
+  "resources": [
+    {
+      "id": "i-0a1prodapi01",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "instance_type": "m5.2xlarge",
+        "state": "running",
+        "volume_ids": [
+          "vol-0prodapi01"
+        ]
+      },
+      "metrics": {
+        "cpu_avg_14d": 11.0,
+        "cpu_max_14d": 34.0
+      },
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0a1prodapi02",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "instance_type": "m5.2xlarge",
+        "state": "running",
+        "volume_ids": [
+          "vol-0prodapi02"
+        ]
+      },
+      "metrics": {
+        "cpu_avg_14d": 12.5,
+        "cpu_max_14d": 38.0
+      },
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0a1prodweb01",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "instance_type": "c5.xlarge",
+        "state": "running"
+      },
+      "metrics": {
+        "cpu_avg_14d": 55.0,
+        "cpu_max_14d": 88.0
+      },
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0a1legacy01",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "instance_type": "m4.xlarge",
+        "state": "running"
+      },
+      "metrics": {
+        "cpu_avg_14d": 31.0,
+        "cpu_max_14d": 72.0
+      },
+      "tags": {
+        "owner": "billing",
+        "environment": "prod"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0a1batch01",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "instance_type": "r5.xlarge",
+        "state": "running"
+      },
+      "metrics": {
+        "cpu_avg_14d": 0.6,
+        "cpu_max_14d": 2.1
+      },
+      "tags": {
+        "owner": "data",
+        "environment": "prod",
+        "cost-center": "cc-300"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0d2devapp01",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "instance_type": "m5.xlarge",
+        "state": "running"
+      },
+      "metrics": {
+        "cpu_avg_14d": 24.0,
+        "cpu_max_14d": 61.0
+      },
+      "tags": {
+        "owner": "platform",
+        "environment": "dev",
+        "cost-center": "cc-200"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0d2devapp02",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "instance_type": "t3.large",
+        "state": "running"
+      },
+      "metrics": {
+        "cpu_avg_14d": 26.0,
+        "cpu_max_14d": 70.0
+      },
+      "tags": {
+        "owner": "platform",
+        "environment": "dev",
+        "cost-center": "cc-200"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "i-0d2oldtest",
+      "type": "ec2_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "instance_type": "t2.medium",
+        "state": "stopped",
+        "stopped_since": "2026-05-02",
+        "volume_ids": [
+          "vol-0oldtest01"
+        ]
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "vol-0prodapi01",
+      "type": "ebs_volume",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "size_gb": 500,
+        "volume_type": "gp2",
+        "state": "in-use"
+      },
+      "metrics": {},
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "vol-0prodapi02",
+      "type": "ebs_volume",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "size_gb": 500,
+        "volume_type": "gp2",
+        "state": "in-use"
+      },
+      "metrics": {},
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "vol-0oldtest01",
+      "type": "ebs_volume",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "size_gb": 200,
+        "volume_type": "gp2",
+        "state": "in-use"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "vol-0orphan01",
+      "type": "ebs_volume",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "size_gb": 1000,
+        "volume_type": "gp2",
+        "state": "available"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "vol-0orphan02",
+      "type": "ebs_volume",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "size_gb": 250,
+        "volume_type": "io1",
+        "state": "available"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "eipalloc-0aa1",
+      "type": "elastic_ip",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "association_id": null
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "eipalloc-0aa2",
+      "type": "elastic_ip",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "association_id": null
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "eipalloc-0aa3",
+      "type": "elastic_ip",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "association_id": "eipassoc-1"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "snap-0old01",
+      "type": "ebs_snapshot",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "size_gb": 500,
+        "start_time": "2025-11-20"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "snap-0old02",
+      "type": "ebs_snapshot",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "size_gb": 800,
+        "start_time": "2025-06-01"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "snap-0recent",
+      "type": "ebs_snapshot",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "size_gb": 500,
+        "start_time": "2026-10-01"
+      },
+      "metrics": {},
+      "tags": {},
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "orders-db",
+      "type": "rds_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "instance_class": "db.r5.2xlarge",
+        "engine": "postgres",
+        "multi_az": true
+      },
+      "metrics": {
+        "cpu_avg_14d": 9.0,
+        "cpu_max_14d": 31.0,
+        "connections_max_14d": 140
+      },
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "staging-db",
+      "type": "rds_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "instance_class": "db.m5.large",
+        "engine": "mysql",
+        "multi_az": false
+      },
+      "metrics": {
+        "cpu_avg_14d": 22.0,
+        "cpu_max_14d": 58.0,
+        "connections_max_14d": 12
+      },
+      "tags": {
+        "owner": "platform",
+        "environment": "staging",
+        "cost-center": "cc-200"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "poc-analytics-db",
+      "type": "rds_instance",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "222222222222",
+      "attributes": {
+        "instance_class": "db.m5.xlarge",
+        "engine": "postgres",
+        "multi_az": false
+      },
+      "metrics": {
+        "cpu_avg_14d": 1.2,
+        "cpu_max_14d": 3.0,
+        "connections_max_14d": 0
+      },
+      "tags": {
+        "owner": "data"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "old-campaign-alb",
+      "type": "load_balancer",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "lb_type": "application"
+      },
+      "metrics": {
+        "request_count_14d": 0
+      },
+      "tags": {
+        "owner": "marketing"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "prod-alb",
+      "type": "load_balancer",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "lb_type": "application"
+      },
+      "metrics": {
+        "request_count_14d": 48000000
+      },
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "acme-app-logs",
+      "type": "s3_bucket",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "standard_gb": 42000,
+        "has_lifecycle_policy": false
+      },
+      "metrics": {},
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    },
+    {
+      "id": "acme-static-assets",
+      "type": "s3_bucket",
+      "provider": "aws",
+      "region": "us-east-1",
+      "account": "111111111111",
+      "attributes": {
+        "standard_gb": 120,
+        "has_lifecycle_policy": true
+      },
+      "metrics": {},
+      "tags": {
+        "owner": "payments",
+        "environment": "prod",
+        "cost-center": "cc-100"
+      },
+      "monthly_cost": null,
+      "cost_source": ""
+    }
+  ]
+}

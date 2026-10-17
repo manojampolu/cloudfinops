@@ -1,0 +1,28 @@
+# Copy to cloudfinops.toml and pass with --config. Every key is optional.
+
+required_tags = ["owner", "environment", "cost-center"]
+lookback_days = 30
+
+# Utilization thresholds (percent, 14-day CloudWatch stats)
+idle_cpu_max_pct = 5.0
+rightsize_cpu_avg_pct = 20.0
+rightsize_cpu_max_pct = 50.0
+
+# Age thresholds (days)
+snapshot_max_age_days = 90
+stopped_instance_max_days = 30
+
+# Non-prod scheduling
+non_prod_env_values = ["dev", "development", "test", "qa", "staging", "sandbox"]
+non_prod_on_hours_per_week = 60
+
+# Anomaly detection: flag a day when z-score >= threshold AND it's at least this many $ above normal
+anomaly_z_threshold = 3.0
+anomaly_min_delta = 50.0
+
+# Commitments
+savings_plan_discount = 0.27
+
+# Storage / network
+s3_large_bucket_gb = 1024
+data_transfer_share_warn = 0.10

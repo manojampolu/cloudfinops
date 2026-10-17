@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Collected cloud data and generated reports can contain account details
+data/
+reports/
+runs/
+demo-azure/
+cloudfinops.toml

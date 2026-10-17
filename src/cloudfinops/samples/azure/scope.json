@@ -1,0 +1,23 @@
+{
+  "provider": "azure",
+  "sample": true,
+  "subscriptions": [
+    {
+      "id": "11111111-aaaa-4aaa-8aaa-111111111111",
+      "name": "acme-prod",
+      "tenant": "00000000-0000-0000-0000-00000000acme"
+    },
+    {
+      "id": "22222222-bbbb-4bbb-8bbb-222222222222",
+      "name": "acme-nonprod",
+      "tenant": "00000000-0000-0000-0000-00000000acme"
+    }
+  ],
+  "period": {
+    "start": "2026-08-17",
+    "end": "2026-10-15"
+  },
+  "metric_days": 14,
+  "collected_at": "2026-10-15T06:00:00+00:00",
+  "errors": []
+}
