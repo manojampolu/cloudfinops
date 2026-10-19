@@ -246,6 +246,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles can't encode every symbol we print
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")

@@ -34,6 +34,9 @@ CONTAINERS_QUERY = "ResourceContainers | project id, name, type, subscriptionId,
 LOG_USAGE_QUERY = ("Usage | where TimeGenerated > ago(30d) | where IsBillable == true "
                    "| summarize BillableGB = sum(Quantity) / 1000.0 by DataType")
 
+# az graph -> resource-graph; az monitor log-analytics query -> log-analytics
+REQUIRED_EXTENSIONS = ("resource-graph", "log-analytics")
+
 TYPE_MAP = {
     "microsoft.compute/virtualmachines": ("azure.vm", "Virtual Machines"),
     "microsoft.compute/disks": ("azure.disk", "Managed Disks"),
@@ -105,8 +108,9 @@ class AzureProvider:
         problems = []
         try:
             ver = runner.run(["az", "version", "-o", "json"])
-            if "resource-graph" not in (ver.get("extensions") or {}):
-                problems.append("missing-extension:resource-graph")
+            for ext in REQUIRED_EXTENSIONS:
+                if ext not in (ver.get("extensions") or {}):
+                    problems.append(f"missing-extension:{ext}")
         except CliError as exc:
             problems.append(str(exc))
         return problems
@@ -284,9 +288,30 @@ class AzureProvider:
         return [(rid, names) for _, rid, names in targets[:cfg.max_metric_resources]]
 
     def _metrics(self, runner: CliRunner, rid: str, names: list[str], start: datetime, end: datetime):
-        return runner.run(["az", "monitor", "metrics", "list", "--resource", rid, "--metrics", *names,
-                           "--aggregation", "Average", "Maximum", "--interval", "PT1H",
-                           "--start-time", start.isoformat(), "--end-time", end.isoformat(), "-o", "json"])
+        def query(metric_names):
+            return runner.run(["az", "monitor", "metrics", "list", "--resource", rid, "--metrics", *metric_names,
+                               "--aggregation", "Average", "Maximum", "--interval", "PT1H",
+                               "--start-time", start.isoformat(), "--end-time", end.isoformat(), "-o", "json"])
+        try:
+            return query(names)
+        except CliError:
+            if len(names) == 1:
+                raise
+        # One unsupported metric (e.g. no guest memory on this VM size) fails the whole call: fetch one by one
+        merged, last_error = None, None
+        for name in names:
+            try:
+                part = query([name])
+            except CliError as exc:
+                last_error = exc
+                continue
+            if merged is None:
+                merged = part
+            else:
+                merged.setdefault("value", []).extend(part.get("value", []))
+        if merged is None:
+            raise last_error
+        return merged
 
     # ------------------------------------------------------------------ normalization
 

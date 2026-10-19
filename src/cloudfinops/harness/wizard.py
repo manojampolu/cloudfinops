@@ -63,7 +63,7 @@ def collect_interactive(provider_name: str, out_root: Path, cfg: Config, subscri
                 problems.remove(p)
     if problems:
         for p in problems:
-            print(f"  ✗ {p}", file=sys.stderr)
+            print(f"  x {p}", file=sys.stderr)
         raise SystemExit(2)
 
     print("\nChecking sign-in (a browser window opens if you are not signed in)...")

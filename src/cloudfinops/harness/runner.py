@@ -100,14 +100,16 @@ class CliRunner:
             interactive: bool = False):
         """Execute a read-only command. Returns parsed JSON (or text) and optionally saves raw output."""
         check_read_only(cmd)
+        exe = shutil.which(cmd[0])  # on Windows the CLIs are az.cmd / gcloud.cmd, not launchable by bare name
+        cmd_exec = [exe, *cmd[1:]] if exe else cmd
         attempt, delay = 0, 2.0
         while True:
             started = time.monotonic()
             if interactive:
-                proc = subprocess.run(cmd, timeout=self.timeout * 2)
+                proc = subprocess.run(cmd_exec, timeout=self.timeout * 2)
                 stdout, stderr = "", ""
             else:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout,
+                proc = subprocess.run(cmd_exec, capture_output=True, text=True, timeout=self.timeout,
                                       env={**os.environ, **QUIET_ENV}, stdin=subprocess.DEVNULL)
                 stdout, stderr = proc.stdout, proc.stderr
             duration = round(time.monotonic() - started, 2)

@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import sys
 from datetime import date, timedelta
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -73,6 +74,7 @@ def test_write_commands_rejected(cmd):
         check_read_only(cmd)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a POSIX shell script as a fake az")
 def test_runner_logs_and_saves_raw(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -245,3 +247,37 @@ def test_register_keeps_decisions_and_verifies(tmp_path):
     with pytest.raises(ValueError):
         reg.update(rec.key, status="done")
     reg.close()
+
+
+def test_metrics_fall_back_to_one_metric_at_a_time(tmp_path):
+    from datetime import datetime, timezone
+    from cloudfinops.harness.runner import CliError
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd, **kw):
+            names = cmd[cmd.index("--metrics") + 1:cmd.index("--aggregation")]
+            self.calls.append(names)
+            if "Available Memory Bytes" in names:
+                raise CliError(cmd, 1, "Failed to find metric configuration for provider")
+            return {"interval": "PT1H", "value": [{"name": {"value": n}, "timeseries": []} for n in names]}
+
+    r = Runner()
+    now = datetime.now(timezone.utc)
+    out = AzureProvider()._metrics(r, "/vm", ["Percentage CPU", "Available Memory Bytes"], now, now)
+    assert [v["name"]["value"] for v in out["value"]] == ["Percentage CPU"]  # CPU kept despite memory failing
+    assert r.calls == [["Percentage CPU", "Available Memory Bytes"], ["Percentage CPU"], ["Available Memory Bytes"]]
+
+
+def test_preflight_requires_extensions(monkeypatch, tmp_path):
+    class Runner:
+        @staticmethod
+        def available(_):
+            return True
+
+        def run(self, cmd, **kw):
+            return {"azure-cli": "2.70.0", "extensions": {"resource-graph": "2.1.0"}}
+
+    assert AzureProvider().preflight(Runner()) == ["missing-extension:log-analytics"]

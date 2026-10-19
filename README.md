@@ -22,6 +22,30 @@ cloudfinops assess
 Core has zero dependencies (Python 3.11+). Azure needs the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli);
 AWS collection needs `boto3`.
 
+## Install on another machine
+
+```bash
+git clone https://github.com/<you>/cloudfinops.git && cd cloudfinops
+python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+pytest -q                                              # should be all green
+```
+
+Then install the CLI for the cloud you are assessing: Azure CLI (`brew install azure-cli`,
+`winget install Microsoft.AzureCLI`, or [other options](https://learn.microsoft.com/cli/azure/install-azure-cli)),
+or the Google Cloud CLI. Python 3.11+ is required.
+
+### First real Azure run: checklist
+
+1. `az login` works and `az account list -o table` shows the subscriptions you expect.
+2. Roles on those subscriptions: Reader, Cost Management Reader, Log Analytics Reader.
+3. Run `cloudfinops assess`. It offers to install the `resource-graph` and `log-analytics` CLI extensions if missing.
+4. Check `runs/azure-*/commands.log` (reads only) and the report's **Data quality** section for failed steps.
+5. Compare the report's 30-day spend with Cost Management → Cost analysis (amortized, same dates).
+6. If something fails, re-run the analysis offline after a fix, without calling Azure again:
+   `cloudfinops assess --from runs/azure-<timestamp>`. Include `scope.json` (errors) and `commands.log`
+   when reporting issues. Both contain subscription IDs, so share them privately.
+
 ## Quick start
 
 ```bash
