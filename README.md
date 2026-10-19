@@ -25,7 +25,7 @@ AWS collection needs `boto3`.
 ## Install on another machine
 
 ```bash
-git clone https://github.com/<you>/cloudfinops.git && cd cloudfinops
+git clone https://github.com/manojampolu/cloudfinops.git && cd cloudfinops
 python3 install.py --cloud azure       # or gcp / aws / all; Windows: py install.py --cloud azure
 ```
 
