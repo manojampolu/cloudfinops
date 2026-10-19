@@ -78,8 +78,10 @@ def collect_interactive(provider_name: str, out_root: Path, cfg: Config, subscri
     if not scopes:
         raise SystemExit(f"This identity cannot read any active {label}.")
     defaults = getattr(provider, "default_scopes", lambda s: s)(scopes)
-    if subscriptions:
-        wanted = {s.lower() for s in subscriptions}
+    if subscriptions and [x.lower() for x in subscriptions] == ["all"]:
+        chosen = scopes
+    elif subscriptions:
+        wanted = {w.lower() for x in subscriptions for w in x.replace(",", " ").split()}
         chosen = [s for s in scopes if s["id"].lower() in wanted or s["name"].lower() in wanted]
         if not chosen:
             raise SystemExit(f"None of {subscriptions} are visible to this identity.")

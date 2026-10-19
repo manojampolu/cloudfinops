@@ -80,6 +80,9 @@ class Config:
         cfg = cls()
         if not path:
             return cfg
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Config file '{path}' not found. Create one with: "
+                                    f"cp cloudfinops.example.toml {path}  (or drop --config to use defaults)")
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
         known = {f.name for f in fields(cls)}

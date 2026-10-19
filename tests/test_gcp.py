@@ -38,3 +38,73 @@ def test_gcp_owner_fallback_is_project():
     from cloudfinops.rules import owner_of
     res = Resource(id="x", type="gcp.run_service", provider="gcp", account="proj-1", group="us-central1")
     assert owner_of(res, Config()) == "project:proj-1"
+
+
+class FakeRunner:
+    """Answers gcloud calls in-process; project 'locked' denies everything."""
+
+    def __init__(self, tmp_path):
+        from pathlib import Path
+        self.run_dir = Path(tmp_path)
+        self.raw_dir = self.run_dir / "raw"
+        self.raw_dir.mkdir(parents=True)
+        self.calls = []
+
+    def run(self, cmd, save_as=None, parse_json=True, interactive=False):
+        from cloudfinops.harness.runner import CliError, check_read_only
+        check_read_only(cmd)
+        self.calls.append(cmd)
+        if "locked" in " ".join(cmd):
+            raise CliError(cmd, 1, "ERROR: (gcloud.services.list) [me@x.com] does not have permission to access "
+                                   "projects instance [locked] (or it may not exist)")
+        if cmd[:3] == ["gcloud", "services", "list"]:
+            data = [{"config": {"name": "run.googleapis.com", "title": "Cloud Run"}}]
+        elif cmd[:3] == ["gcloud", "config", "get"]:
+            return "open"
+        elif cmd[:3] == ["gcloud", "auth", "print-access-token"]:
+            return "token"
+        else:
+            data = []
+        if save_as:
+            self.save_json(save_as, data)
+        return data
+
+    def http_get(self, url, token, headers=None, save_as=None):
+        from cloudfinops.harness.runner import CliError
+        if "/projects/locked/" in url:
+            raise CliError(["GET", url], 403, '{"error": {"code": 403, "message": "Permission denied"}}')
+        return {"timeSeries": []}
+
+    def save_json(self, rel, data):
+        import json
+        path = self.raw_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+        return path
+
+
+def test_unreadable_projects_are_skipped_once(tmp_path):
+    from cloudfinops.config import Config
+    from cloudfinops.providers.gcp import GcpProvider
+    runner = FakeRunner(tmp_path)
+    scopes = [{"id": "open", "name": "open", "billing": True}, {"id": "locked", "name": "locked", "billing": False}]
+    manifest = GcpProvider().collect(runner, scopes, Config(), log=lambda *_: None)
+    assert manifest["no_access"] == ["locked"]
+    assert [s["id"] for s in manifest["subscriptions"]] == ["open"]
+    assert sum(1 for c in runner.calls if "locked" in " ".join(c)) == 1  # only the access probe
+    locked_errors = [e for e in manifest["errors"] if "locked" in e["scope"]]
+    assert [e["step"] for e in locked_errors] == ["access"]  # one entry, not one per step
+    assert all("\n" not in e["message"] for e in manifest["errors"])
+
+
+def test_missing_config_message(tmp_path):
+    from cloudfinops.config import Config
+    with pytest.raises(FileNotFoundError, match="cp cloudfinops.example.toml"):
+        Config.load(tmp_path / "nope.toml")
+
+
+def test_short_error():
+    from cloudfinops.providers.gcp import short_error
+    assert short_error('failed (403): {\n "error": {\n "code": 403,\n "message": "Permission denied (or the resource may not exist)."') \
+        == "Permission denied (or the resource may not exist)."
+    assert short_error("`gcloud x` failed (1): ERROR: (gcloud.x) [a@b] does not have\npermission").startswith("[a@b] does not have permission")

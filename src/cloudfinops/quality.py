@@ -9,6 +9,7 @@ from datetime import timedelta
 from .analysis import CostSummary, window
 from .config import Config
 from .models import Dataset
+from .providers.gcp import is_permission_error, short_error
 
 METRIC_TYPES = {"azure.vm": "cpu_avg", "azure.app_service_plan": "cpu_avg", "ec2_instance": "cpu_avg_14d",
                 "gcp.vm": "cpu_avg"}
@@ -31,8 +32,16 @@ def check(ds: Dataset, summary: CostSummary, cfg: Config) -> list[QualityIssue]:
     for e in ds.scope.get("errors", []):
         errors[e["step"]].append(e)
     for step, items in errors.items():
-        out.append(QualityIssue("error" if step in ("inventory", "costs") else "warn", f"collection:{step}",
-                                f"{len(items)} {step} call(s) failed, e.g. {items[0]['scope']}: {items[0]['message'][:160]}",
+        first = short_error(items[0]["message"])
+        if step == "access":
+            out.append(QualityIssue("warn", "access", f"Not assessed: {first}. Projects: {items[0]['scope']}",
+                                    "These projects are excluded from every total and finding."))
+            continue
+        denied = sum(1 for i in items if i.get("permission", is_permission_error(i["message"])))
+        level = "error" if step in ("inventory", "costs") and denied < len(items) else "warn"
+        detail = f" ({denied} permission denied)" if denied else ""
+        out.append(QualityIssue(level, f"collection:{step}",
+                                f"{len(items)} {step} call(s) failed{detail}, e.g. {items[0]['scope']}: {first}",
                                 "Findings depending on this data are missing or marked as needing validation."))
 
     # --- billing coverage

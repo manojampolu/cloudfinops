@@ -124,6 +124,21 @@ def _point_value(p: dict) -> float:
     return 0.0
 
 
+def is_permission_error(msg: str) -> bool:
+    m = msg.lower()
+    return "permission" in m or "(403)" in m or "forbidden" in m
+
+
+def short_error(msg: str) -> str:
+    """First meaningful line of a gcloud / HTTP error, without the echoed command or JSON body."""
+    m = re.search(r'"message":\s*"([^"]+)"', msg)
+    if m:
+        return m.group(1)[:200]
+    m = re.search(r"ERROR: \([^)]*\)\s*(.*)", msg, re.S)
+    text = m.group(1) if m else msg
+    return " ".join(text.split())[:200]
+
+
 def _p95(values: list[float]) -> float:
     vals = sorted(values)
     return vals[min(len(vals) - 1, int(round(0.95 * (len(vals) - 1))))] if vals else 0.0
@@ -198,16 +213,33 @@ class GcpProvider:
                 return fn()
             except Exception as exc:
                 msg = str(exc)
-                log(f"  ! {step} ({scope}): {msg[:160]}")
-                manifest["errors"].append({"step": step, "scope": scope, "message": msg[:1000]})
+                log(f"  ! {step} ({scope}): {short_error(msg)}")
+                manifest["errors"].append({"step": step, "scope": scope, "message": short_error(msg),
+                                           "permission": is_permission_error(msg)})
                 return None
 
         log("Listing enabled APIs per project...")
         services: dict[str, set[str]] = {}
+        no_access: list[str] = []
         for p in projects:
-            data = guard("services", p, lambda: runner.run(["gcloud", "services", "list", "--enabled", "--project", p,
-                                                             "--format=json"], save_as=f"services/{p}.json"))
-            services[p] = {s["config"]["name"] for s in data or []}
+            try:
+                data = runner.run(["gcloud", "services", "list", "--enabled", "--project", p, "--format=json"],
+                                  save_as=f"services/{p}.json")
+                services[p] = {s["config"]["name"] for s in data or []}
+            except CliError as exc:
+                if is_permission_error(str(exc)):
+                    no_access.append(p)  # can list the project but not read it: skip every other step
+                else:
+                    services[p] = set()
+                    manifest["errors"].append({"step": "services", "scope": p, "message": short_error(str(exc))})
+        if no_access:
+            log(f"  skipping {len(no_access)} project(s) this account cannot read: {', '.join(no_access)}")
+            manifest["no_access"] = no_access
+            manifest["errors"].append({"step": "access", "scope": ", ".join(no_access), "permission": True,
+                                       "message": f"{len(no_access)} project(s) are visible but not readable by this "
+                                                  "account (grant roles/viewer to include them)"})
+            projects = [p for p in projects if p not in no_access]
+            manifest["subscriptions"] = [s for s in scopes if s["id"] not in no_access]
         cfg_project = guard("config", "core/project", lambda: runner.run(
             ["gcloud", "config", "get", "core/project"], parse_json=False).strip()) or ""
         if cfg_project and cfg_project not in services:
