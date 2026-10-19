@@ -26,14 +26,17 @@ AWS collection needs `boto3`.
 
 ```bash
 git clone https://github.com/<you>/cloudfinops.git && cd cloudfinops
-python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-pytest -q                                              # should be all green
+python3 install.py --cloud azure       # or gcp / aws / all; Windows: py install.py --cloud azure
 ```
 
-Then install the CLI for the cloud you are assessing: Azure CLI (`brew install azure-cli`,
-`winget install Microsoft.AzureCLI`, or [other options](https://learn.microsoft.com/cli/azure/install-azure-cli)),
-or the Google Cloud CLI. Python 3.11+ is required.
+`install.py` (standard library only) does the whole setup:
+1. checks for Python 3.11+
+2. creates `.venv` and installs cloudfinops with its packages
+3. checks the cloud CLI and offers to install it (Homebrew on macOS, winget on Windows, instructions on Linux)
+4. adds the `resource-graph` and `log-analytics` Azure CLI extensions
+5. runs the test suite
+
+Use `python3 install.py --check` to see what is missing without changing anything, and `--yes` to install without prompts.
 
 ### First real Azure run: checklist
 
