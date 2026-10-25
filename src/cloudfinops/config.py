@@ -67,6 +67,9 @@ class Config:
     aca_idle_requests_30d: float = 50.0  # ... and requests below this -> idle
     aca_min_monthly_cost: float = 5.0  # ignore apps cheaper than this
 
+    # Sharing: "", "ids" or "all" - write redacted copies of the outputs (see redact.py)
+    redact: str = ""
+
     # Scope: limit the report to these resource groups (collection stays subscription-wide)
     resource_groups: list[str] = field(default_factory=list)
 

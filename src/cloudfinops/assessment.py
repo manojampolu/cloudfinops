@@ -34,7 +34,7 @@ class Assessment:
 
 
 def assess(ds: Dataset, cfg: Config, out_dir: Path, run_dir: Path | None = None,
-           register_path: Path | None = None, disabled: set[str] | None = None) -> Assessment:
+           register_path: Path | None = None, disabled: set[str] | None = None, redact: str = "") -> Assessment:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -78,6 +78,9 @@ def assess(ds: Dataset, cfg: Config, out_dir: Path, run_dir: Path | None = None,
     }, indent=2, default=str), encoding="utf-8")
     if register_path:
         outputs["register"] = Path(register_path)
+    if redact:
+        from .redact import write_redacted
+        outputs.update(write_redacted(outputs, ds, redact, out_dir))
     return Assessment(ds, summary, recs, quality, tree, profiles, outputs)
 
 

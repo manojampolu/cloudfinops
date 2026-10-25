@@ -56,3 +56,19 @@ def test_cli_resource_groups_writes_subfolder(tmp_path, capsys):
     out = run / "rg-rg-dev-app-rg-test"
     assert (out / "report.html").exists()
     assert "resource groups: rg-dev-app, rg-test" in (out / "report.html").read_text()
+
+
+def test_register_rule_stats(tmp_path):
+    db = tmp_path / "reg.db"
+    assess(load(), Config(), tmp_path / "out", register_path=db)
+    reg = Register(db)
+    unattached = [r for r in reg.rows() if r["rule_id"] == "az-disk-unattached"]
+    for row in unattached[:4]:
+        reg.update(row["key"], status="rejected")
+    reg.update(unattached[4]["key"], status="approved", validated_savings=10)
+    stats = {s["rule_id"]: s for s in reg.rule_stats()}
+    st = stats["az-disk-unattached"]
+    assert (st["accepted"], st["rejected"]) == (1, 4) and st["acceptance"] == pytest.approx(0.2) and st["noisy"]
+    assert stats["az-vm-idle"]["acceptance"] is None
+    reg.close()
+    assert main(["register", "stats", "--db", str(db)]) == 0
