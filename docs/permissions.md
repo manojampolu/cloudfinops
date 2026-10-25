@@ -27,7 +27,8 @@ It reads no application data: only configuration, metrics, cost and log-volume m
 | Inventory | `az graph query -q "Resources \| project ..."` and `ResourceContainers`, paged |
 | Costs | `az account get-access-token`, then HTTPS POST to `.../providers/Microsoft.CostManagement/query` (a query API; the tool refuses any other POST) |
 | Native recommendations | `az advisor recommendation list --category Cost` |
-| Utilization | `az monitor metrics list` (CPU, available memory, disk IOPS, App Service CPU/memory, Container Apps UsageNanoCores/Requests/Replicas; 14 days hourly) |
+| Defender plans | `az security pricing list` (which Defender for Cloud plans are enabled per subscription) |
+| Utilization | `az monitor metrics list` (CPU, available memory, disk IOPS, App Service CPU/memory, Container Apps UsageNanoCores/Requests/Replicas, PostgreSQL/MySQL cpu/memory/connections, Firewall DataProcessed, Bastion sessions, NAT ByteCount; 14 days hourly) |
 | Logging | `az monitor log-analytics query` (Usage table only), `az monitor log-analytics workspace table list` |
 | Prices | HTTPS GET to the public Azure Retail Prices API (no credentials) |
 

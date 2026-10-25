@@ -17,7 +17,7 @@ from .rules import scenario_total
 CATEGORY_LABELS = {
     "waste": "Idle & orphaned", "rightsizing": "Rightsizing", "scheduling": "Non-prod scheduling",
     "modernization": "Storage & SKU modernization", "logging": "Logging", "commitment": "Commitments",
-    "advisor": "Azure Advisor", "governance": "Governance",
+    "advisor": "Azure Advisor", "governance": "Governance", "licensing": "Licensing (Hybrid Benefit, Defender)",
 }
 
 

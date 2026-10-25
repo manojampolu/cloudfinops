@@ -1,0 +1,1 @@
+[{"name":"VirtualMachines","pricingTier":"Standard","subPlan":"P2"},{"name":"StorageAccounts","pricingTier":"Standard","subPlan":"DefenderForStorageV2"},{"name":"KeyVaults","pricingTier":"Free"}]

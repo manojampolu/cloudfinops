@@ -149,6 +149,12 @@ Run `cloudfinops rules` for the live list.
 | Container Apps | `az-aca-idle` | CPU p95 < 2% of allocated vCPU × replicas and almost no HTTP requests |
 | Container Apps | `az-aca-low-traffic` | Meaningful cost but < 500 requests/30 days (min replicas ≥ 1 → scale to zero) |
 | Container Apps | `az-aca-nonprod-min-replicas` | Non-prod (tag/name/RG) apps keeping ≥ 1 replica warm 24/7 |
+| Licensing | `az-ahb-windows`, `az-ahb-sql-vm`, `az-ahb-sql-paas` | Azure Hybrid Benefit not applied (Windows VMs, SQL Server VMs, vCore SQL DB / pools / MI); SQL Developer edition for non-prod SQL VMs |
+| Licensing | `az-defender-nonprod` | Paid Defender for Cloud plans on non-prod subscriptions (Servers P2 → P1) |
+| Network | `az-firewall`, `az-bastion` | Idle (no traffic / sessions) or non-prod Firewall and Bastion (deallocate off-hours, Developer SKU) |
+| Network | `az-vnet-gateway-unused`, `az-nat-idle`, `az-ddos-plan` | VPN/ER gateways without connections, NAT gateways with no subnets or traffic, DDoS plans (none protected / IP Protection cheaper) |
+| Databases | `az-db-flex-idle`, `az-db-flex-rightsize`, `az-db-flex-nonprod-ha`, `az-db-flex-nonprod-stop` | PostgreSQL / MySQL Flexible Server: no connections, low CPU, HA in non-prod, non-prod running 24/7 |
+| Compute | `az-vmss-idle`, `az-vmss-rightsize` | Standalone VM scale sets (AKS node pools excluded) |
 | Logging | `az-logging` (`az-log-basic-plan`, `az-log-containerlog-v2`, `az-log-retention`, `az-log-commitment-tier`, `az-log-review-ingestion`) | Expensive tables, plans, retention, commitment tiers |
 | Commitments | `az-commitment`, `az-advisor` | Stable compute baseline *after* other savings; Advisor recommendations as inputs |
 | Governance | `az-untagged` | Spend without owner/environment/cost-center tags |

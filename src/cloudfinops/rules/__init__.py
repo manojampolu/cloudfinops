@@ -10,7 +10,7 @@ from . import aws, azure, gcp  # noqa: F401  (registers rules)
 from .base import RULES, Context, owner_of
 
 COMPUTE_RESOURCE_TYPES = {"azure.vm", "azure.vmss", "azure.aks", "azure.app_service_plan", "ec2_instance",
-                          "rds_instance", "gcp.vm", "gcp.run_service", "gcp.sql"}
+                          "rds_instance", "gcp.vm", "gcp.run_service", "gcp.sql", "azure.container_app"}
 COMMITMENT_RULES = {"az-commitment", "savings-plan"}
 
 

@@ -41,6 +41,21 @@ DISK_TIERS = [
     (32767, 3604.48, 2457.60, 1090.58),
 ]
 SNAPSHOT_GB_MONTH = 0.05
+# Licences (approximate pay-as-you-go licence components, USD per vCPU-hour)
+WINDOWS_LICENSE_VCPU_HOUR = 0.046
+WINDOWS_LICENSE_VCPU_HOUR_B = 0.004  # B-series carries a much smaller Windows uplift
+SQL_VM_LICENSE_VCPU_HOUR = {"enterprise": 0.375, "standard": 0.10, "web": 0.009}
+SQL_PAAS_LICENSE_VCORE_HOUR = {"businesscritical": 0.375, "generalpurpose": 0.10, "hyperscale": 0.10}
+# Network appliances and security (USD)
+FIREWALL_HOURLY = {"basic": 0.395, "standard": 1.25, "premium": 1.75}
+BASTION_HOURLY = {"developer": 0.0, "basic": 0.19, "standard": 0.29, "premium": 0.45}
+VPN_GATEWAY_HOURLY = {"basic": 0.04, "vpngw1": 0.19, "vpngw2": 0.49, "vpngw3": 1.25, "vpngw1az": 0.36,
+                      "standard": 0.19, "highperformance": 0.49, "ergw1az": 0.42, "ultraperformance": 2.0}
+NAT_GATEWAY_HOURLY = 0.045
+DDOS_PLAN_MONTHLY = 2944.0
+DDOS_IP_PROTECTION_MONTHLY = 199.0
+DEFENDER_SERVERS_MONTHLY = {"p1": 5.0, "p2": 15.0}
+
 # Container Apps consumption plan (per second); idle rate applies to min replicas with no traffic
 ACA_ACTIVE_VCPU_S, ACA_IDLE_VCPU_S, ACA_GIB_S = 0.000024, 0.000003, 0.000003
 PUBLIC_IP_HOURLY = 0.005
@@ -188,6 +203,16 @@ def estimate_monthly(res, hours: float = HOURS) -> float | None:
             return LB_STANDARD_HOURLY * hours if (res.sku or "").lower() == "standard" else 0.0
         case "azure.appgw":
             return APPGW_V2_HOURLY * hours
+        case "azure.firewall":
+            return FIREWALL_HOURLY.get((a.get("tier") or "standard").lower(), 1.25) * hours if not a.get("deallocated") else 0.0
+        case "azure.bastion":
+            return BASTION_HOURLY.get((res.sku or "basic").lower(), 0.19) * hours
+        case "azure.vnet_gateway":
+            return VPN_GATEWAY_HOURLY.get((res.sku or "").lower(), 0.19) * hours
+        case "azure.nat_gateway":
+            return NAT_GATEWAY_HOURLY * hours
+        case "azure.ddos_plan":
+            return DDOS_PLAN_MONTHLY
         case "azure.container_app":
             mins = int(a.get("min_replicas") or 0)
             if not mins or a.get("state") != "running":

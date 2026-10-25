@@ -62,9 +62,21 @@ TYPE_MAP = {
     "microsoft.containerregistry/registries": ("azure.acr", "Container Registries"),
     "microsoft.app/containerapps": ("azure.container_app", "Container Apps"),
     "microsoft.app/managedenvironments": ("azure.aca_env", "Container Apps Environments"),
+    "microsoft.network/azurefirewalls": ("azure.firewall", "Azure Firewall"),
+    "microsoft.network/bastionhosts": ("azure.bastion", "Azure Bastion"),
+    "microsoft.network/virtualnetworkgateways": ("azure.vnet_gateway", "VPN / ExpressRoute Gateways"),
+    "microsoft.network/connections": ("azure.vnet_connection", "Gateway Connections"),
+    "microsoft.network/ddosprotectionplans": ("azure.ddos_plan", "DDoS Protection Plans"),
+    "microsoft.dbforpostgresql/flexibleservers": ("azure.postgres_flex", "PostgreSQL Flexible Servers"),
+    "microsoft.dbformysql/flexibleservers": ("azure.mysql_flex", "MySQL Flexible Servers"),
+    "microsoft.sqlvirtualmachine/sqlvirtualmachines": ("azure.sql_vm", "SQL Server on VMs"),
+    "microsoft.sql/servers/elasticpools": ("azure.sql_pool", "SQL Elastic Pools"),
+    "microsoft.sql/managedinstances": ("azure.sql_mi", "SQL Managed Instances"),
 }
 # Types that normally carry no direct charge (used by data-quality checks)
-FREE_TYPES = {"azure.nic", "azure.vnet", "azure.nsg", "azure.web_app", "azure.sql_server"}
+FREE_TYPES = {"azure.nic", "azure.vnet", "azure.nsg", "azure.web_app", "azure.sql_server", "azure.vnet_connection",
+              "azure.sql_vm"}
+DB_FLEX_TYPES = ("azure.postgres_flex", "azure.mysql_flex")
 
 METRICS_BY_TYPE = {
     "azure.vm": ["Percentage CPU", "Available Memory Bytes"],
@@ -72,8 +84,15 @@ METRICS_BY_TYPE = {
     "azure.disk": ["Composite Disk Read Operations/sec", "Composite Disk Write Operations/sec"],
     "azure.app_service_plan": ["CpuPercentage", "MemoryPercentage"],
     "azure.container_app": ["UsageNanoCores", "Requests", "Replicas"],
+    "azure.postgres_flex": ["cpu_percent", "memory_percent", "active_connections"],
+    "azure.mysql_flex": ["cpu_percent", "memory_percent", "active_connections"],
+    "azure.firewall": ["DataProcessed"],
+    "azure.bastion": ["sessions"],
+    "azure.nat_gateway": ["ByteCount"],
 }
-AGGREGATIONS_BY_TYPE = {"azure.container_app": ("Average", "Maximum", "Total")}
+AGGREGATIONS_BY_TYPE = {"azure.container_app": ("Average", "Maximum", "Total"),
+                        "azure.firewall": ("Total",), "azure.nat_gateway": ("Total",),
+                        "azure.bastion": ("Average", "Maximum")}
 DEFAULT_AGGREGATIONS = ("Average", "Maximum")
 
 
@@ -189,6 +208,13 @@ class AzureProvider:
                 ["az", "advisor", "recommendation", "list", "--category", "Cost", "--subscription", sub, "-o", "json"]))
             if recs is not None:
                 runner.save_json(f"advisor/{sub}.json", recs)
+
+        log("Collecting Defender for Cloud plans...")
+        for sub in sub_ids:
+            plans = guard("defender", sub, lambda: runner.run(
+                ["az", "security", "pricing", "list", "--subscription", sub, "-o", "json"]))
+            if plans is not None:
+                runner.save_json(f"defender/{sub}.json", plans.get("value", plans) if isinstance(plans, dict) else plans)
 
         log("Collecting Log Analytics usage...")
         for ws in (r for r in resources if _lower(r.get("type")) == "microsoft.operationalinsights/workspaces"):
@@ -308,6 +334,9 @@ class AzureProvider:
                 if not _lower((r.get("sku") or {}).get("name")).startswith("premium") or \
                         _lower(props.get("diskState")) != "attached":
                     continue
+            elif rtype in DB_FLEX_TYPES:
+                if _lower(props.get("state")) not in ("ready", "running", ""):
+                    continue
             elif rtype not in METRICS_BY_TYPE:
                 continue
             targets.append((cost[rid], rid, METRICS_BY_TYPE[rtype], AGGREGATIONS_BY_TYPE.get(rtype, DEFAULT_AGGREGATIONS)))
@@ -362,6 +391,8 @@ class AzureProvider:
         self._attach_metrics(raw, by_id, cfg)
         advisor = self._advisor(raw, by_id)
         log_usage = self._logging(raw, by_id)
+        defender = {f.stem: json.loads(f.read_text()) or [] for f in sorted((raw / "defender").glob("*.json"))} \
+            if (raw / "defender").exists() else {}
 
         if records:
             scope.setdefault("period", {})
@@ -373,7 +404,7 @@ class AzureProvider:
             scope=scope, currency=currency,
             extras={"pricing_model_daily": pricing_model, "advisor": advisor, "log_usage": log_usage,
                     "pricebook": PriceBook(cache_dir=raw / "prices", online=False),
-                    "subscription_names": sub_names, "free_types": FREE_TYPES},
+                    "subscription_names": sub_names, "free_types": FREE_TYPES, "defender": defender},
         )
 
     def _resource(self, r: dict, sub_names: dict) -> Resource:
@@ -405,6 +436,7 @@ class AzureProvider:
             a.update(vm_size=size, power_state=power.split("/")[-1] if power else "unknown",
                      state="running" if "running" in power else (power.split("/")[-1] or "unknown"),
                      os_type=(storage.get("osDisk") or {}).get("osType", ""),
+                     license_type=props.get("licenseType") or "",
                      priority=props.get("priority", "Regular"),
                      disk_ids=[_lower(d) for d in disks if d],
                      nic_ids=[_lower(n["id"]) for n in (props.get("networkProfile") or {}).get("networkInterfaces", [])],
@@ -470,6 +502,37 @@ class AzureProvider:
                      workload_profile=props.get("workloadProfileName") or "Consumption",
                      ingress="external" if ingress.get("external") else ("internal" if ingress else "none"),
                      scale_rules=sorted({k for rule in scale.get("rules") or [] for k in rule if k != "name"}))
+        elif rtype in DB_FLEX_TYPES:
+            storage = props.get("storage") or {}
+            res.sku = sku.get("name", "")
+            state = _lower(props.get("state"))
+            a.update(tier=sku.get("tier", ""), state="running" if state in ("ready", "running") else state or "unknown",
+                     storage_gb=storage.get("storageSizeGB"), version=props.get("version", ""),
+                     ha_mode=(props.get("highAvailability") or {}).get("mode", "Disabled"))
+        elif rtype == "azure.sql_vm":
+            a.update(license_type=props.get("sqlServerLicenseType", ""), edition=props.get("sqlImageSku", ""),
+                     vm_id=_lower(props.get("virtualMachineResourceId")))
+        elif rtype in ("azure.sql_db", "azure.sql_pool", "azure.sql_mi"):
+            a.update(tier=sku.get("tier", ""), vcores=sku.get("capacity") if sku.get("family") or rtype == "azure.sql_mi" else None,
+                     license_type=props.get("licenseType", ""), serverless="_S_" in str(sku.get("name", "")).upper())
+        elif rtype == "azure.firewall":
+            a.update(tier=((props.get("sku") or {}).get("tier") or ""),
+                     deallocated=not props.get("ipConfigurations") and not props.get("hubIPAddresses"))
+        elif rtype == "azure.bastion":
+            res.sku = sku.get("name", "Basic")
+        elif rtype == "azure.vnet_gateway":
+            a.update(gateway_type=props.get("gatewayType", ""), vpn_type=props.get("vpnType", ""),
+                     point_to_site=bool(props.get("vpnClientConfiguration")),
+                     gw_sku=(props.get("sku") or {}).get("name", ""))
+            res.sku = a["gw_sku"]
+        elif rtype == "azure.vnet_connection":
+            a.update(gateway_ids=[_lower((props.get(k) or {}).get("id")) for k in ("virtualNetworkGateway1", "virtualNetworkGateway2")
+                                  if (props.get(k) or {}).get("id")],
+                     status=props.get("connectionStatus", ""))
+        elif rtype == "azure.nat_gateway":
+            a["subnet_count"] = len(props.get("subnets") or [])
+        elif rtype == "azure.ddos_plan":
+            a["protected_vnets"] = [_lower(v.get("id")) for v in props.get("virtualNetworks") or []]
         elif rtype == "azure.log_workspace":
             res.sku = (props.get("sku") or {}).get("name", "")
             a.update(customer_id=props.get("customerId"), retention_days=props.get("retentionInDays", 30),
@@ -493,6 +556,12 @@ class AzureProvider:
                 rels += [Relationship(p, r.id, "ip_of") for p in a.get("public_ip_ids", [])]
             elif r.type == "azure.web_app" and a.get("server_farm_id"):
                 rels.append(Relationship(r.id, a["server_farm_id"], "uses_plan"))
+            elif r.type == "azure.sql_vm" and a.get("vm_id"):
+                rels.append(Relationship(r.id, a["vm_id"], "sql_on"))
+            elif r.type == "azure.vnet_connection":
+                rels += [Relationship(r.id, g, "connects") for g in a.get("gateway_ids", [])]
+            elif r.type == "azure.ddos_plan":
+                rels += [Relationship(r.id, v, "protects") for v in a.get("protected_vnets", [])]
             elif r.type == "azure.container_app" and a.get("environment_id"):
                 rels.append(Relationship(r.id, a["environment_id"], "runs_in"))
             elif r.type == "azure.snapshot" and a.get("source_id"):
@@ -566,7 +635,7 @@ class AzureProvider:
             m["metrics_window_days"] = cfg.metric_days
             expected = max(1, int(cfg.metric_days * 24 / hours))
 
-            cpu_name = "Percentage CPU" if "Percentage CPU" in series else "CpuPercentage"
+            cpu_name = next((n for n in ("Percentage CPU", "CpuPercentage", "cpu_percent") if n in series), "")
             if cpu_name in series:
                 avgs = [p["average"] for p in series[cpu_name] if p.get("average") is not None]
                 maxs = [p.get("maximum", p["average"]) for p in series[cpu_name] if p.get("average") is not None]
@@ -583,10 +652,19 @@ class AzureProvider:
                     m["mem_used_p95"] = _p95(used)
                 elif avail:
                     m["mem_available_min_gb"] = min(avail) / 1024 ** 3
-            if "MemoryPercentage" in series:
-                vals = [p["average"] for p in series["MemoryPercentage"] if p.get("average") is not None]
+            for mem_name in ("MemoryPercentage", "memory_percent"):
+                vals = [p["average"] for p in series.get(mem_name, []) if p.get("average") is not None]
                 if vals:
                     m["mem_used_p95"] = _p95(vals)
+            if "active_connections" in series:
+                vals = [p.get("maximum", p.get("average")) for p in series["active_connections"]
+                        if p.get("maximum", p.get("average")) is not None]
+                m["connections_max"] = max(vals, default=0.0)
+            for metric, key, scale in (("DataProcessed", "data_processed_gb", 1e9), ("ByteCount", "bytes_gb", 1e9)):
+                if metric in series:
+                    m[key] = sum(p.get("total") or 0.0 for p in series[metric]) / scale
+            if "sessions" in series:
+                m["sessions_max"] = max((p.get("maximum") or p.get("average") or 0.0 for p in series["sessions"]), default=0.0)
             disk_r = series.get("Composite Disk Read Operations/sec")
             disk_w = series.get("Composite Disk Write Operations/sec")
             if disk_r is not None or disk_w is not None:
