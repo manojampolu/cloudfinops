@@ -12,7 +12,7 @@ from .models import Dataset
 from .providers.gcp import is_permission_error, short_error
 
 METRIC_TYPES = {"azure.vm": "cpu_avg", "azure.app_service_plan": "cpu_avg", "ec2_instance": "cpu_avg_14d",
-                "gcp.vm": "cpu_avg"}
+                "gcp.vm": "cpu_avg", "azure.container_app": "cpu_avg"}
 
 
 @dataclass

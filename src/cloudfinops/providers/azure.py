@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import statistics
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
@@ -59,6 +60,8 @@ TYPE_MAP = {
     "microsoft.sql/servers/databases": ("azure.sql_db", "SQL Databases"),
     "microsoft.keyvault/vaults": ("azure.key_vault", "Key Vaults"),
     "microsoft.containerregistry/registries": ("azure.acr", "Container Registries"),
+    "microsoft.app/containerapps": ("azure.container_app", "Container Apps"),
+    "microsoft.app/managedenvironments": ("azure.aca_env", "Container Apps Environments"),
 }
 # Types that normally carry no direct charge (used by data-quality checks)
 FREE_TYPES = {"azure.nic", "azure.vnet", "azure.nsg", "azure.web_app", "azure.sql_server"}
@@ -68,7 +71,10 @@ METRICS_BY_TYPE = {
     "azure.vmss": ["Percentage CPU"],
     "azure.disk": ["Composite Disk Read Operations/sec", "Composite Disk Write Operations/sec"],
     "azure.app_service_plan": ["CpuPercentage", "MemoryPercentage"],
+    "azure.container_app": ["UsageNanoCores", "Requests", "Replicas"],
 }
+AGGREGATIONS_BY_TYPE = {"azure.container_app": ("Average", "Maximum", "Total")}
+DEFAULT_AGGREGATIONS = ("Average", "Maximum")
 
 
 def _lower(s) -> str:
@@ -161,10 +167,19 @@ class AzureProvider:
         log(f"  {len(resources)} resources")
 
         log("Collecting costs (Cost Management, amortized)...")
+        first_query = True
         for sub in sub_ids:
+            token = guard("costs", f"{sub}:token", lambda: self._arm_token(runner, sub))
+            if not token:
+                continue
             for name, grouping in (("by_resource", ["ResourceId", "ServiceName"]),
                                    ("by_pricing_model", ["ServiceName", "PricingModel"])):
-                data = guard("costs", f"{sub}:{name}", lambda: self._cost_query(runner, sub, start, end, grouping))
+                if not first_query and cfg.cost_query_pause_s > 0:
+                    log(f"  pausing {cfg.cost_query_pause_s:.0f}s between Cost Management queries (rate limits)")
+                    time.sleep(cfg.cost_query_pause_s)
+                first_query = False
+                data = guard("costs", f"{sub}:{name}",
+                             lambda: self._cost_query(runner, token, sub, start, end, grouping))
                 if data is not None:
                     runner.save_json(f"costs/{sub}_{name}.json", data)
 
@@ -197,8 +212,8 @@ class AzureProvider:
         m_start = m_end - timedelta(days=cfg.metric_days)
         done = 0
         with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(self._metrics, runner, rid, names, m_start, m_end): rid
-                       for rid, names in targets}
+            futures = {pool.submit(self._metrics, runner, rid, names, m_start, m_end, aggs): rid
+                       for rid, names, aggs in targets}
             for fut in as_completed(futures):
                 rid = futures[fut]
                 try:
@@ -243,7 +258,19 @@ class AzureProvider:
             if not token:
                 return rows
 
-    def _cost_query(self, runner: CliRunner, sub: str, start: date, end: date, grouping: list[str]) -> dict:
+    def _arm_token(self, runner: CliRunner, sub: str) -> str:
+        """Access token for Azure Resource Manager in the subscription's tenant."""
+        resp = runner.run(["az", "account", "get-access-token", "--resource", "https://management.azure.com/",
+                           "--subscription", sub, "-o", "json"])
+        return resp["accessToken"]
+
+    def _cost_query(self, runner: CliRunner, token: str, sub: str, start: date, end: date,
+                    grouping: list[str]) -> dict:
+        """Cost Management query over HTTPS.
+
+        Pages are fetched by POSTing to `nextLink`. This is done over HTTP rather than `az rest` because the
+        nextLink contains `&$skiptoken=`, which cmd.exe (az.cmd on Windows) treats as a command separator.
+        """
         body = {
             "type": "AmortizedCost", "timeframe": "Custom",
             "timePeriod": {"from": f"{start}T00:00:00Z", "to": f"{end}T23:59:59Z"},
@@ -255,14 +282,14 @@ class AzureProvider:
                f"?api-version={COST_API}")
         columns, rows = None, []
         while url:
-            resp = runner.run(["az", "rest", "--method", "post", "--url", url, "--body", json.dumps(body), "-o", "json"])
+            resp = runner.http_post(url, token, body)
             props = resp.get("properties", {})
             columns = columns or props.get("columns", [])
             rows += props.get("rows", [])
             url = props.get("nextLink")
         return {"columns": columns, "rows": rows}
 
-    def _metric_targets(self, resources: list[dict], raw_dir: Path, cfg: Config) -> list[tuple[str, list[str]]]:
+    def _metric_targets(self, resources: list[dict], raw_dir: Path, cfg: Config) -> list[tuple[str, list[str], tuple]]:
         cost = defaultdict(float)
         for f in (raw_dir / "costs").glob("*_by_resource.json"):
             data = json.loads(f.read_text())
@@ -283,14 +310,15 @@ class AzureProvider:
                     continue
             elif rtype not in METRICS_BY_TYPE:
                 continue
-            targets.append((cost[rid], rid, METRICS_BY_TYPE[rtype]))
-        targets.sort(reverse=True)
-        return [(rid, names) for _, rid, names in targets[:cfg.max_metric_resources]]
+            targets.append((cost[rid], rid, METRICS_BY_TYPE[rtype], AGGREGATIONS_BY_TYPE.get(rtype, DEFAULT_AGGREGATIONS)))
+        targets.sort(key=lambda t: (-t[0], t[1]))
+        return [(rid, names, aggs) for _, rid, names, aggs in targets[:cfg.max_metric_resources]]
 
-    def _metrics(self, runner: CliRunner, rid: str, names: list[str], start: datetime, end: datetime):
+    def _metrics(self, runner: CliRunner, rid: str, names: list[str], start: datetime, end: datetime,
+                 aggregations: tuple = DEFAULT_AGGREGATIONS):
         def query(metric_names):
             return runner.run(["az", "monitor", "metrics", "list", "--resource", rid, "--metrics", *metric_names,
-                               "--aggregation", "Average", "Maximum", "--interval", "PT1H",
+                               "--aggregation", *aggregations, "--interval", "PT1H",
                                "--start-time", start.isoformat(), "--end-time", end.isoformat(), "-o", "json"])
         try:
             return query(names)
@@ -427,6 +455,21 @@ class AzureProvider:
                                   "mode": p.get("mode"), "autoscale": p.get("enableAutoScaling", False),
                                   "min": p.get("minCount"), "max": p.get("maxCount")} for p in pools],
                      node_count=sum(p.get("count") or 0 for p in pools))
+        elif rtype == "azure.container_app":
+            tmpl = props.get("template") or {}
+            scale = tmpl.get("scale") or {}
+            containers = tmpl.get("containers") or []
+            vcpu = sum(float((c.get("resources") or {}).get("cpu") or 0) for c in containers)
+            mem = sum(_gib((c.get("resources") or {}).get("memory")) for c in containers)
+            ingress = (props.get("configuration") or {}).get("ingress") or {}
+            status = _lower(props.get("runningStatus") or "running")
+            res.sku = f"{vcpu:g} vCPU / {mem:g} GiB"
+            a.update(min_replicas=int(scale.get("minReplicas") or 0), max_replicas=int(scale.get("maxReplicas") or 10),
+                     vcpu=vcpu, memory_gib=mem, state="running" if status.startswith("running") else status,
+                     environment_id=_lower(props.get("managedEnvironmentId") or props.get("environmentId")),
+                     workload_profile=props.get("workloadProfileName") or "Consumption",
+                     ingress="external" if ingress.get("external") else ("internal" if ingress else "none"),
+                     scale_rules=sorted({k for rule in scale.get("rules") or [] for k in rule if k != "name"}))
         elif rtype == "azure.log_workspace":
             res.sku = (props.get("sku") or {}).get("name", "")
             a.update(customer_id=props.get("customerId"), retention_days=props.get("retentionInDays", 30),
@@ -450,6 +493,8 @@ class AzureProvider:
                 rels += [Relationship(p, r.id, "ip_of") for p in a.get("public_ip_ids", [])]
             elif r.type == "azure.web_app" and a.get("server_farm_id"):
                 rels.append(Relationship(r.id, a["server_farm_id"], "uses_plan"))
+            elif r.type == "azure.container_app" and a.get("environment_id"):
+                rels.append(Relationship(r.id, a["environment_id"], "runs_in"))
             elif r.type == "azure.snapshot" and a.get("source_id"):
                 rels.append(Relationship(r.id, a["source_id"], "snapshot_of"))
             elif r.type == "azure.aks":
@@ -552,6 +597,8 @@ class AzureProvider:
                             totals[p["timeStamp"]] += p["average"]
                 vals = list(totals.values())
                 m.update(iops_p95=_p95(vals), iops_max=max(vals, default=0.0))
+            if res.type == "azure.container_app":
+                _container_app_usage(res, series, expected, cfg)
 
     def _advisor(self, raw: Path, by_id: dict[str, Resource]) -> list[dict]:
         out = []
@@ -595,6 +642,49 @@ class AzureProvider:
             if ws in by_id:
                 by_id[ws].attributes["ingest_gb_30d"] = sum(data["tables"].values())
         return dict(usage)
+
+
+def _gib(value) -> float:
+    s = str(value or "0").strip()
+    for unit, f in (("Gi", 1.0), ("Mi", 1 / 1024), ("G", 1.0), ("M", 1 / 1024)):
+        if s.endswith(unit):
+            return float(s[: -len(unit)] or 0) * f
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _container_app_usage(res: Resource, series: dict, expected_points: int, cfg: Config) -> None:
+    """CPU % of allocated vCPU x running replicas, request volume and replica statistics for a Container App."""
+    m, vcpu = res.metrics, res.attributes.get("vcpu") or 0.0
+    replicas = {p["timeStamp"]: p for p in series.get("Replicas", [])}
+
+    def replicas_at(ts, key="average"):
+        p = replicas.get(ts) or {}
+        return p.get(key) if p.get(key) is not None else p.get("average")
+
+    rep_avg = [p["average"] for p in series.get("Replicas", []) if p.get("average") is not None]
+    if rep_avg:
+        m.update(replicas_avg=statistics.fmean(rep_avg), replicas_p95=_p95(rep_avg), replicas_min=min(rep_avg),
+                 uptime_share=min(1.0, sum(1 for v in rep_avg if v >= 1) / expected_points))
+    cpu_pct, cpu_peak = [], []
+    for p in series.get("UsageNanoCores", []):
+        if p.get("average") is None or not vcpu:
+            continue
+        reps = max(1.0, replicas_at(p["timeStamp"]) or 0.0)
+        cpu_pct.append(min(100.0, p["average"] / 1e9 / (vcpu * reps) * 100))
+        peak_reps = max(1.0, replicas_at(p["timeStamp"], "maximum") or 0.0)
+        peak = p.get("maximum") if p.get("maximum") is not None else p["average"]
+        cpu_peak.append(min(100.0, peak / 1e9 / (vcpu * peak_reps) * 100))  # never above 100% of allocation
+    if cpu_pct:
+        m.update(cpu_avg=statistics.fmean(cpu_pct), cpu_p95=_p95(cpu_pct), cpu_max=max(cpu_peak))
+    if "Requests" in series:
+        totals = [p.get("total") or 0.0 for p in series["Requests"]]
+        window_days = max(1, cfg.metric_days)
+        m["requests_window"] = sum(totals)
+        m["requests_30d"] = sum(totals) * 30 / window_days
+        m["active_share"] = min(1.0, sum(1 for v in totals if v > 0) / expected_points)
 
 
 def _read(path: Path, default):

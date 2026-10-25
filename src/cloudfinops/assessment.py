@@ -52,7 +52,8 @@ def assess(ds: Dataset, cfg: Config, out_dir: Path, run_dir: Path | None = None,
         reg = Register(register_path)
         try:
             reg.record_run(ds.provider, str(run_dir or out_dir), (str(summary.start), str(summary.end)),
-                           summary.window_total, recs, totals["estimate"], ds.records)
+                           summary.window_total, recs, totals["estimate"], ds.records,
+                           mark_missing=not ds.scope.get("resource_groups"))  # partial scope: don't retire others
             reg_totals, decisions = reg.totals(), reg.decisions()
         finally:
             reg.close()
@@ -105,7 +106,8 @@ def _write_inventory_csv(ds: Dataset, path: Path, cfg: Config) -> None:
     from .estate import utilization_bucket
 
     cols = ["id", "name", "service", "type", "sku", "account", "group", "region", "monthly_cost", "cost_source",
-            "utilization", "cpu_avg", "cpu_p95", "mem_used_p95", "iops_p95", "related", "tags"]
+            "utilization", "cpu_avg", "cpu_p95", "mem_used_p95", "iops_p95", "requests_30d", "replicas_p95",
+            "related", "tags"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(cols)
@@ -113,7 +115,8 @@ def _write_inventory_csv(ds: Dataset, path: Path, cfg: Config) -> None:
             w.writerow([r.id, r.display_name, r.service, r.type, r.sku, r.account, r.group, r.region,
                         round(r.monthly_cost, 2) if r.monthly_cost is not None else "", r.cost_source,
                         utilization_bucket(r, cfg), *(round(r.metrics[k], 1) if k in r.metrics else ""
-                                                       for k in ("cpu_avg", "cpu_p95", "mem_used_p95", "iops_p95")),
+                                                       for k in ("cpu_avg", "cpu_p95", "mem_used_p95", "iops_p95",
+                                                                 "requests_30d", "replicas_p95")),
                         len(r.related), json.dumps(r.tags) if r.tags else ""])
 
 

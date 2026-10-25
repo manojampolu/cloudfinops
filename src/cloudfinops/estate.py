@@ -54,7 +54,7 @@ class ServiceProfile:
 def utilization_bucket(res: Resource, cfg: Config) -> str:
     m = res.metrics
     if "cpu_avg" not in m and "cpu_avg_14d" not in m:
-        if res.type in ("azure.vm", "azure.vmss", "azure.app_service_plan", "ec2_instance", "gcp.vm"):
+        if res.type in ("azure.vm", "azure.vmss", "azure.app_service_plan", "azure.container_app", "ec2_instance", "gcp.vm"):
             return "stopped" if res.attributes.get("state") not in ("running", None) else "no metrics"
         return ""
     cpu_max = m.get("cpu_max", m.get("cpu_max_14d", 0))
@@ -83,6 +83,8 @@ def _resource_detail(res: Resource, by_id: dict[str, Resource]) -> str:
         parts.append(f"mem p95 {m['mem_used_p95']:.0f}%")
     if "iops_p95" in m:
         parts.append(f"IOPS p95 {m['iops_p95']:.0f}")
+    if "replicas_p95" in m:
+        parts.append(f"replicas p95 {m['replicas_p95']:.1f}")
     for key, label in (("requests_30d", "requests 30d"), ("executions_30d", "executions 30d")):
         if key in m:
             parts.append(f"{label}: {m[key]:,.0f}")

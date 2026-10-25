@@ -25,9 +25,9 @@ It reads no application data: only configuration, metrics, cost and log-volume m
 |---|---|
 | Sign-in check | `az account show`, `az login` (only if not signed in), `az account list` |
 | Inventory | `az graph query -q "Resources \| project ..."` and `ResourceContainers`, paged |
-| Costs | `az rest --method post --url .../providers/Microsoft.CostManagement/query` (a query API; read-only) |
+| Costs | `az account get-access-token`, then HTTPS POST to `.../providers/Microsoft.CostManagement/query` (a query API; the tool refuses any other POST) |
 | Native recommendations | `az advisor recommendation list --category Cost` |
-| Utilization | `az monitor metrics list` (CPU, available memory, disk IOPS, App Service CPU/memory; 14 days hourly) |
+| Utilization | `az monitor metrics list` (CPU, available memory, disk IOPS, App Service CPU/memory, Container Apps UsageNanoCores/Requests/Replicas; 14 days hourly) |
 | Logging | `az monitor log-analytics query` (Usage table only), `az monitor log-analytics workspace table list` |
 | Prices | HTTPS GET to the public Azure Retail Prices API (no credentials) |
 
@@ -38,7 +38,10 @@ The only local change is installing the `resource-graph` CLI extension if it is 
 - **Guest memory**: VM memory utilization comes from the platform metric "Available Memory Bytes". Where
   it is unavailable, rightsizing findings are marked *needs validation* rather than guessed.
 - **Cost Management** data for the current day can lag by 8–24 hours; the collection window ends yesterday.
-- **Throttling**: Cost Management and Monitor APIs rate-limit; the runner retries with backoff.
+- **Throttling**: Cost Management rate-limits heavily. The tool pauses between queries (`cost_query_pause_s`,
+  default 45 s) and honours the Retry-After headers on 429 responses.
+- **Windows**: `az` is a batch file there, so cost pages (whose URLs contain `&$skiptoken=`) are fetched over HTTPS.
+  Other arguments containing cmd.exe special characters are quoted.
 
 ## AWS (via `cloudfinops collect aws`)
 

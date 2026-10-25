@@ -189,6 +189,8 @@ def render_html(ds: Dataset, summary: CostSummary, recs: list[Recommendation], q
     nv = sum(1 for r in recs if r.needs_validation)
     subs = ds.scope.get("subscriptions") or []
     scope_txt = ", ".join(s.get("name", s.get("id", "")) for s in subs) or "uploaded data"
+    if ds.scope.get("resource_groups"):
+        scope_txt += " · resource groups: " + ", ".join(ds.scope["resource_groups"])
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     by_name = {r.id: r.display_name for r in ds.resources}
 
@@ -273,7 +275,8 @@ def render_html(ds: Dataset, summary: CostSummary, recs: list[Recommendation], q
 <style>{CSS}</style></head><body><div class="wrap">
 <header><h1>Cloud Cost Assessment</h1>
 <p>{e(ds.provider.upper())} · {e(scope_txt)} · {('billing ' + e(period_label(summary, cfg))) if ds.records else 'no billing data'} · generated {generated}</p>
-{''.join(f'<p class="q-error small" style="margin-top:6px">{e(n)}</p>' for n in ds.scope.get('notes', []))}</header>
+{''.join(f'<p class="q-error small" style="margin-top:6px">{e(n)}</p>' for n in ds.scope.get('notes', []))}
+{''.join(f'<p class="muted small" style="margin-top:6px">{e(n)}</p>' for n in ds.scope.get('info_notes', []))}</header>
 <nav><a href="#summary">Summary</a><a href="#map">Estate map</a><a href="#services">Services</a>
 <a href="#opportunities">Opportunities</a><a href="#owners">Owner review</a><a href="#spend">Spend trends</a>
 <a href="#quality">Data quality</a><a href="#method">Method</a></nav>

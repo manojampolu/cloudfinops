@@ -281,3 +281,64 @@ def test_preflight_requires_extensions(monkeypatch, tmp_path):
             return {"azure-cli": "2.70.0", "extensions": {"resource-graph": "2.1.0"}}
 
     assert AzureProvider().preflight(Runner()) == ["missing-extension:log-analytics"]
+
+
+# ---------------------------------------------------------------- container apps, cost pagination, runner
+
+def test_container_app_usage_and_rules(dataset, findings):
+    apps = {r.name: r for r in dataset.resources if r.type == "azure.container_app"}
+    assert set(apps) == {"ca-orders-worker", "ca-legacy-pdf", "ca-poc-ocr", "ca-dev-portal"}
+    worker = apps["ca-orders-worker"].metrics
+    assert 20 < worker["cpu_avg"] < 40 and worker["cpu_max"] <= 100 and worker["replicas_p95"] >= 3
+    assert apps["ca-legacy-pdf"].attributes["min_replicas"] == 1 and apps["ca-legacy-pdf"].sku == "1 vCPU / 2 GiB"
+    by_rule = lambda rid: {r.resource_name for r in findings if r.rule_id == rid}  # noqa: E731
+    assert by_rule("az-aca-idle") == {"ca-poc-ocr"}
+    assert by_rule("az-aca-low-traffic") == {"ca-legacy-pdf"}
+    assert "ca-dev-portal" in by_rule("az-aca-nonprod-min-replicas")
+    assert not any(r.resource_name == "ca-orders-worker" for r in findings if r.rule_id.startswith("az-aca"))
+
+
+def test_container_app_cpu_is_capped_at_allocation():
+    from cloudfinops.models import Resource
+    from cloudfinops.providers.azure import _container_app_usage
+    res = Resource(id="a", type="azure.container_app", attributes={"vcpu": 0.5})
+    series = {"UsageNanoCores": [{"timeStamp": "t1", "average": 2e8, "maximum": 9e9}],
+              "Replicas": [{"timeStamp": "t1", "average": 1, "maximum": 1}],
+              "Requests": [{"timeStamp": "t1", "total": 7}]}
+    _container_app_usage(res, series, expected_points=1, cfg=Config())
+    assert res.metrics["cpu_avg"] == pytest.approx(40.0) and res.metrics["cpu_max"] == 100.0
+    assert res.metrics["requests_window"] == 7 and res.metrics["active_share"] == 1.0
+
+
+def test_cost_query_follows_next_link_over_https():
+    calls = []
+
+    class Runner:
+        def http_post(self, url, token, body):
+            calls.append(url)
+            if "skiptoken" in url:
+                return {"properties": {"columns": [{"name": "Cost"}], "rows": [[2.0]], "nextLink": None}}
+            return {"properties": {"columns": [{"name": "Cost"}], "rows": [[1.0]],
+                                   "nextLink": url + "&$skiptoken=abc"}}
+
+    out = AzureProvider()._cost_query(Runner(), "tok", "sub-1", date(2026, 9, 1), date(2026, 9, 30), ["ResourceId"])
+    assert out["rows"] == [[1.0], [2.0]] and len(calls) == 2 and "&$skiptoken=abc" in calls[1]
+
+
+def test_http_post_is_limited_to_query_apis(tmp_path):
+    runner = CliRunner(tmp_path)
+    with pytest.raises(NotReadOnlyError):
+        runner.http_post("https://management.azure.com/subscriptions/s/resourceGroups/rg?api-version=1", "t", {})
+
+
+def test_windows_batch_cmdline_quotes_special_characters():
+    from cloudfinops.harness.runner import windows_batch_cmdline
+    line = windows_batch_cmdline(["C:\\az.cmd", "rest", "--url", "https://x/q?a=1&$skiptoken=Z", "-q", "R | project id"])
+    assert '"https://x/q?a=1&$skiptoken=Z"' in line and '"R | project id"' in line and line.startswith("C:\\az.cmd rest")
+
+
+def test_retry_after_headers():
+    from cloudfinops.harness.runner import _retry_after
+    assert _retry_after({"x-ms-ratelimit-microsoft.costmanagement-entity-retry-after": "37"}) == 37.0
+    assert _retry_after({"Retry-After": "5"}) == 5.0
+    assert _retry_after({}) is None

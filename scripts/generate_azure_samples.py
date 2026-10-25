@@ -44,6 +44,7 @@ T_PLAN, T_SITE = "microsoft.web/serverfarms", "microsoft.web/sites"
 T_VMSS, T_AKS = "microsoft.compute/virtualmachinescalesets", "microsoft.containerservice/managedclusters"
 T_LAW, T_SA = "microsoft.operationalinsights/workspaces", "microsoft.storage/storageaccounts"
 T_KV = "microsoft.keyvault/vaults"
+T_ACA, T_ENV = "microsoft.app/containerapps", "microsoft.app/managedenvironments"
 
 ARM_TYPE = {T_VM: "Microsoft.Compute/virtualMachines", T_DISK: "Microsoft.Compute/disks",
             T_SNAP: "Microsoft.Compute/snapshots", T_NIC: "Microsoft.Network/networkInterfaces",
@@ -51,7 +52,8 @@ ARM_TYPE = {T_VM: "Microsoft.Compute/virtualMachines", T_DISK: "Microsoft.Comput
             T_AGW: "Microsoft.Network/applicationGateways", T_PLAN: "Microsoft.Web/serverfarms",
             T_SITE: "Microsoft.Web/sites", T_VMSS: "Microsoft.Compute/virtualMachineScaleSets",
             T_AKS: "Microsoft.ContainerService/managedClusters", T_LAW: "Microsoft.OperationalInsights/workspaces",
-            T_SA: "Microsoft.Storage/storageAccounts", T_KV: "Microsoft.KeyVault/vaults"}
+            T_SA: "Microsoft.Storage/storageAccounts", T_KV: "Microsoft.KeyVault/vaults",
+            T_ACA: "Microsoft.App/containerApps", T_ENV: "Microsoft.App/managedEnvironments"}
 
 
 def rid(sub, rg, rtype, name):
@@ -109,6 +111,19 @@ def vm(sub, rg, name, size, cpu_avg=None, mem_used=None, power="running", tags=N
     if power == "running" and cpu_avg is not None:
         metrics[vm_id.lower()] = {"kind": "vm", "cpu": cpu_avg, "mem": mem_used, "mem_gb": vm_memory_gb(size)}
     return vm_id
+
+
+def container_app(sub, rg, env, name, cpu, mem_gi, min_r, max_r, cost_day, tags, metric):
+    app = add(sub, rg, T_ACA, name, {
+        "managedEnvironmentId": env, "workloadProfileName": "Consumption", "runningStatus": "Running",
+        "configuration": {"ingress": {"external": True, "targetPort": 8080}},
+        "template": {"containers": [{"name": "app", "image": f"acmeacr.azurecr.io/{name}:1.4",
+                                     "resources": {"cpu": cpu, "memory": f"{mem_gi}Gi"}}],
+                     "scale": {"minReplicas": min_r, "maxReplicas": max_r,
+                               "rules": [{"name": "http", "http": {"metadata": {"concurrentRequests": "50"}}}]}}},
+        tags=tags, service="Azure Container Apps", cost_day=cost_day)
+    metrics[app.lower()] = {"kind": "aca", "vcpu": cpu, **metric}
+    return app
 
 
 def build():
@@ -220,6 +235,18 @@ def build():
     metrics[plan.lower()] = {"kind": "plan", "cpu": 6, "mem": 35}
     for i in range(1, 4):
         add(NONPROD, "rg-dev-app", T_SITE, f"app-dev-{i}", {"serverFarmId": plan, "state": "Running"}, tags=dev_tags)
+    env = add(PROD, "rg-apps", T_ENV, "cae-prod", {"workloadProfiles": [{"name": "Consumption"}]},
+              tags=prod_tags("platform", "platform-team"))
+    container_app(PROD, "rg-apps", env, "ca-orders-worker", 1.0, 2, 2, 10, 5.6, prod_tags("orders", "api-team"),
+                  {"cpu": 30, "replicas": 3, "requests_per_h": 900})
+    container_app(PROD, "rg-apps", env, "ca-legacy-pdf", 1.0, 2, 1, 3, 1.4, prod_tags("billing", "finance-it"),
+                  {"cpu": 6, "replicas": 1, "requests_per_h": 0.1})
+    container_app(PROD, "rg-apps", env, "ca-poc-ocr", 2.0, 4, 1, 2, 2.2, {"owner": "data-team"},
+                  {"cpu": 0.4, "replicas": 1, "requests_per_h": 0.02})
+    dev_env = add(NONPROD, "rg-dev-app", T_ENV, "cae-dev", {}, tags=dev_tags)
+    container_app(NONPROD, "rg-dev-app", dev_env, "ca-dev-portal", 0.5, 1, 1, 4, 1.1, dev_tags,
+                  {"cpu": 15, "replicas": 1, "requests_per_h": 40})
+
     add(NONPROD, "rg-dev-monitoring", T_LAW, "law-dev", {"customerId": "aaaaaaaa-0000-0000-0000-000000000002",
         "retentionInDays": 30, "sku": {"name": "PerGB2018"}}, tags=dev_tags, service="Log Analytics")
 
@@ -296,6 +323,18 @@ def metric_payload(spec):
     elif spec["kind"] == "disk":
         value.append(series("Composite Disk Read Operations/sec", "CountPerSecond", spec["iops"] * 0.6, cap=1e6))
         value.append(series("Composite Disk Write Operations/sec", "CountPerSecond", spec["iops"] * 0.4, cap=1e6))
+    elif spec["kind"] == "aca":
+        data_nano, data_req, data_rep = [], [], []
+        for ts in stamps:
+            t = ts.isoformat().replace("+00:00", "Z")
+            reps = spec["replicas"]
+            nano = spec["cpu"] / 100 * spec["vcpu"] * reps * 1e9 * rnd.uniform(0.6, 1.3)
+            data_nano.append({"timeStamp": t, "average": round(nano), "maximum": round(nano * 1.8)})
+            data_req.append({"timeStamp": t, "total": round(spec["requests_per_h"] * 6 * rnd.uniform(0, 2))})
+            data_rep.append({"timeStamp": t, "average": reps, "maximum": reps + (1 if spec["requests_per_h"] > 100 else 0)})
+        value += [{"name": {"value": "UsageNanoCores"}, "unit": "NanoCores", "timeseries": [{"data": data_nano}]},
+                  {"name": {"value": "Requests"}, "unit": "Count", "timeseries": [{"data": data_req}]},
+                  {"name": {"value": "Replicas"}, "unit": "Count", "timeseries": [{"data": data_rep}]}]
     elif spec["kind"] == "plan":
         value.append(series("CpuPercentage", "Percent", spec["cpu"]))
         value.append(series("MemoryPercentage", "Percent", spec["mem"], spread=(0.9, 1.1), peak=1.1))

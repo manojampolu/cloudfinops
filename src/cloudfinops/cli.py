@@ -60,6 +60,11 @@ def _assess_run_dir(run_dir: Path, out_dir: Path, args, register: Path | None) -
         cfg.gcp_billing_table = args.billing_table
     provider = get_provider(getattr(args, "provider", None) or _provider_of(run_dir))
     ds = provider.load(run_dir, cfg)
+    groups = getattr(args, "resource_groups", None) or cfg.resource_groups
+    if groups:
+        from .scope import filter_resource_groups
+        ds = filter_resource_groups(ds, groups)
+        out_dir = Path(out_dir) / ("rg-" + "-".join(ds.scope["resource_groups"])[:80])
     result = assess(ds, cfg, out_dir, run_dir=run_dir, register_path=register, disabled=set(args.disable or []))
     t = result.totals
     nv = sum(1 for r in result.recommendations if r.needs_validation)
@@ -202,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--subscriptions", "--projects", dest="subscriptions", nargs="*",
                    help="subscription/project ids or names (default: pick interactively)")
     p.add_argument("--billing-table", help="gcp: BigQuery billing export table project.dataset.table")
+    p.add_argument("--resource-groups", nargs="*", metavar="RG",
+                   help="azure: report only on these resource groups (case-insensitive); output goes to rg-<names>/")
     p.add_argument("--tenant", help="tenant id/domain to sign in to")
     p.add_argument("--device-code", action="store_true", help="sign in with a device code instead of a browser")
     p.add_argument("--yes", action="store_true", help="non-interactive: accept defaults, all visible subscriptions")

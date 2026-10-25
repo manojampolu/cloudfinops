@@ -26,3 +26,15 @@ savings_plan_discount = 0.27
 # Storage / network
 s3_large_bucket_gb = 1024
 data_transfer_share_warn = 0.10
+
+# Azure Container Apps
+aca_low_requests_30d = 500     # min replicas >= 1 and fewer requests than this -> scale-to-zero candidate
+aca_idle_cpu_max_pct = 2.0     # CPU p95 below this and ...
+aca_idle_requests_30d = 50     # ... fewer requests than this -> idle
+aca_min_monthly_cost = 5.0     # ignore cheaper apps
+
+# Report only on these Azure resource groups (same as --resource-groups); collection stays subscription-wide
+# resource_groups = ["rg-dev-app", "rg-test"]
+
+# Pause between Cost Management queries to avoid 429 throttling (seconds)
+cost_query_pause_s = 45

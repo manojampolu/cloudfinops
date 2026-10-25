@@ -224,6 +224,87 @@ def plan_scale_in(res: Resource, ctx: Context):
                 validation_steps=["Keep >= 2 instances if the app has an availability SLA"])
 
 
+# =========================================================================== container apps
+
+def _aca_usage(res: Resource) -> list[str]:
+    m, a = res.metrics, res.attributes
+    ev = [f"min/max replicas {a.get('min_replicas')}/{a.get('max_replicas')} ({res.sku}, {a.get('workload_profile')})"]
+    if "requests_window" in m:
+        ev.append(f"HTTP requests: {m['requests_window']:,.0f} in {int(m.get('metrics_window_days', 14))} days "
+                  f"(~{m['requests_30d']:,.0f} per 30 days)")
+    if "cpu_p95" in m:
+        ev.append(f"CPU vs allocated vCPU x replicas: avg {m['cpu_avg']:.1f}%, p95 {m['cpu_p95']:.1f}%")
+    if "replicas_avg" in m:
+        ev.append(f"Replicas: avg {m['replicas_avg']:.1f}, p95 {m['replicas_p95']:.1f}, min {m['replicas_min']:.0f}")
+    return ev
+
+
+def _non_http_scaling(res: Resource) -> list[str]:
+    other = [r for r in res.attributes.get("scale_rules") or [] if r != "http"]
+    return [f"Non-HTTP scale rules ({', '.join(other)}): work may arrive without HTTP requests"] if other else []
+
+
+@resource_rule("az-aca-idle", "Container Apps with very low CPU and almost no HTTP traffic", "azure.container_app")
+def aca_idle(res: Resource, ctx: Context):
+    m, cfg = res.metrics, ctx.cfg
+    if _cost(res) < cfg.aca_min_monthly_cost or "cpu_p95" not in m or "requests_30d" not in m:
+        return None
+    if m["cpu_p95"] >= cfg.aca_idle_cpu_max_pct or m["requests_30d"] >= cfg.aca_idle_requests_30d:
+        return None
+    non_http = _non_http_scaling(res)
+    return make("az-aca-idle", res, title=f"Idle Container App ({res.sku})", category="waste",
+                est_monthly_savings=_cost(res), confidence="low" if non_http else "medium", risk="medium",
+                evidence=[*_aca_usage(res), _cost_evidence(res)],
+                missing_evidence=non_http,
+                action="Confirm with the owner; delete the app or set minReplicas to 0 so it scales to zero.",
+                validation_steps=["Check queue/event/cron triggers and internal callers before removing"])
+
+
+@resource_rule("az-aca-low-traffic", "Container Apps whose cost is out of line with HTTP traffic", "azure.container_app")
+def aca_low_traffic(res: Resource, ctx: Context):
+    m, a, cfg = res.metrics, res.attributes, ctx.cfg
+    if _cost(res) < cfg.aca_min_monthly_cost or "requests_30d" not in m or m["requests_30d"] >= cfg.aca_low_requests_30d:
+        return None
+    if m.get("cpu_p95", 100) < cfg.aca_idle_cpu_max_pct and m["requests_30d"] < cfg.aca_idle_requests_30d:
+        return None  # az-aca-idle covers it
+    non_http = _non_http_scaling(res)
+    if a.get("min_replicas", 0) >= 1:
+        idle_share = 1 - m.get("active_share", 0.0)
+        return make("az-aca-low-traffic", res,
+                    title=f"Container App keeps {a['min_replicas']} replica(s) warm for ~{m['requests_30d']:,.0f} requests/month",
+                    category="waste", est_monthly_savings=_cost(res) * idle_share, confidence="low",
+                    evidence=[*_aca_usage(res), f"Hours with any request: {m.get('active_share', 0):.0%}", _cost_evidence(res)],
+                    assumptions=["Scaling to zero removes the cost of hours with no requests"],
+                    missing_evidence=["Cold-start latency tolerance", *non_http],
+                    action="Set minReplicas to 0 (scale to zero) or move the app to a shared, smaller workload profile.",
+                    validation_steps=["Measure cold-start time; keep 1 warm replica only for latency-critical APIs"])
+    return make("az-aca-low-traffic", res, title=f"Container App costs {_money(_cost(res))}/mo for ~{m['requests_30d']:,.0f} requests/month",
+                category="waste", est_monthly_savings=0.0, savings_low=0.0, savings_high=_cost(res) * 0.5,
+                confidence="low", evidence=[*_aca_usage(res), _cost_evidence(res)],
+                assumptions=["Upper bound: half the cost is from over-allocated CPU/memory or background work"],
+                missing_evidence=["What consumes CPU without HTTP traffic", *non_http],
+                action="Review CPU/memory allocation and background loops; right-size the container resources.")
+
+
+@resource_rule("az-aca-nonprod-min-replicas", "Non-production Container Apps with warm replicas 24/7", "azure.container_app")
+def aca_nonprod_min_replicas(res: Resource, ctx: Context):
+    m, a, cfg = res.metrics, res.attributes, ctx.cfg
+    reason = is_non_prod(res, ctx)
+    if not reason or a.get("min_replicas", 0) < 1 or m.get("uptime_share", 0) < cfg.scheduling_min_uptime_share:
+        return None
+    if _cost(res) < 1:
+        return None
+    off = 1 - cfg.non_prod_on_hours_per_week / 168
+    return make("az-aca-nonprod-min-replicas", res, title=f"Non-prod Container App runs {a['min_replicas']}+ replica(s) 24/7",
+                category="scheduling", est_monthly_savings=_cost(res) * off, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", f"Replicas >= 1 for {m['uptime_share']:.0%} of hours",
+                          *_aca_usage(res), _cost_evidence(res)],
+                assumptions=[f"Scaled to zero outside {cfg.non_prod_on_hours_per_week:.0f}h/week"],
+                missing_evidence=["Agreed operating hours"],
+                action="Set minReplicas to 0, or add a KEDA cron scale rule that keeps replicas only in working hours.",
+                validation_steps=["Check scheduled jobs and integration tests that call this app"])
+
+
 # =========================================================================== storage & network
 
 @resource_rule("az-disk-unattached", "Managed disks not attached to any VM", "azure.disk")

@@ -61,7 +61,17 @@ class Config:
         "AppServiceHTTPLogs", "StorageBlobLogs", "AKSControlPlane", "ACSCallAutomationIncomingOperations",
     ])
 
+    # Azure Container Apps
+    aca_low_requests_30d: float = 500.0  # below this (with min replicas >= 1) -> scale-to-zero candidate
+    aca_idle_cpu_max_pct: float = 2.0  # CPU p95 below this ...
+    aca_idle_requests_30d: float = 50.0  # ... and requests below this -> idle
+    aca_min_monthly_cost: float = 5.0  # ignore apps cheaper than this
+
+    # Scope: limit the report to these resource groups (collection stays subscription-wide)
+    resource_groups: list[str] = field(default_factory=list)
+
     # Collection / mapping
+    cost_query_pause_s: float = 45.0  # pause between Cost Management queries (limits 429 throttling)
     collection_days: int = 60
     metric_days: int = 14
     max_metric_resources: int = 500

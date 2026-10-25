@@ -41,6 +41,8 @@ DISK_TIERS = [
     (32767, 3604.48, 2457.60, 1090.58),
 ]
 SNAPSHOT_GB_MONTH = 0.05
+# Container Apps consumption plan (per second); idle rate applies to min replicas with no traffic
+ACA_ACTIVE_VCPU_S, ACA_IDLE_VCPU_S, ACA_GIB_S = 0.000024, 0.000003, 0.000003
 PUBLIC_IP_HOURLY = 0.005
 LB_STANDARD_HOURLY = 0.025
 APPGW_V2_HOURLY = 0.246
@@ -186,6 +188,11 @@ def estimate_monthly(res, hours: float = HOURS) -> float | None:
             return LB_STANDARD_HOURLY * hours if (res.sku or "").lower() == "standard" else 0.0
         case "azure.appgw":
             return APPGW_V2_HOURLY * hours
+        case "azure.container_app":
+            mins = int(a.get("min_replicas") or 0)
+            if not mins or a.get("state") != "running":
+                return None  # usage-based; only billing data can tell
+            return mins * hours * 3600 * (float(a.get("vcpu") or 0) * ACA_IDLE_VCPU_S + float(a.get("memory_gib") or 0) * ACA_GIB_S)
         case "azure.app_service_plan":
             hourly = APP_SERVICE_HOURLY.get((res.sku or "").lower())
             return hourly * hours * int(a.get("capacity") or 1) if hourly is not None else None

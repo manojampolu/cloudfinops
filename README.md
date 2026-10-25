@@ -67,7 +67,14 @@ brew install azure-cli                 # once
 cloudfinops assess                     # opens browser sign-in if needed, then lets you pick subscriptions
 cloudfinops assess --subscriptions acme-prod --device-code --zip
 cloudfinops assess --from runs/azure-20261017-1030 --config cloudfinops.toml   # re-analyze offline
+cloudfinops assess --from runs/azure-20261017-1030 --resource-groups rg-dev rg-test   # report on some RGs only
 ```
+
+`--resource-groups` (or `resource_groups = [...]` in the config) narrows the report, findings and inventory to those
+resource groups; AKS node resource groups follow their cluster. Collection stays subscription-wide, so one collection
+can produce a DEV report and a TEST report. Each goes to its own `rg-<names>/` folder inside the run folder, and
+subscription-level commitment analysis is left out. Container Apps thresholds: `aca_low_requests_30d`,
+`aca_idle_cpu_max_pct`, `aca_idle_requests_30d`, `aca_min_monthly_cost`.
 
 Required roles: Reader, Cost Management Reader, Log Analytics Reader. See [docs/permissions.md](docs/permissions.md)
 for the exact commands. [docs/assessment-playbook.md](docs/assessment-playbook.md) covers how to run the
@@ -139,6 +146,9 @@ Run `cloudfinops rules` for the live list.
 | Rightsizing | `az-vm-rightsize`, `az-plan-scale-in` | Low CPU p95 (and memory where available) → one size down, priced via the Retail Prices API |
 | Scheduling | `az-nonprod-schedule`, `az-aks-nonprod-stop` | Non-prod VMs/VMSS/AKS (by tag or name) running 24/7 |
 | Storage | `az-disk-premium-lowiops` | Premium SSD with low IOPS → Standard SSD |
+| Container Apps | `az-aca-idle` | CPU p95 < 2% of allocated vCPU × replicas and almost no HTTP requests |
+| Container Apps | `az-aca-low-traffic` | Meaningful cost but < 500 requests/30 days (min replicas ≥ 1 → scale to zero) |
+| Container Apps | `az-aca-nonprod-min-replicas` | Non-prod (tag/name/RG) apps keeping ≥ 1 replica warm 24/7 |
 | Logging | `az-logging` (`az-log-basic-plan`, `az-log-containerlog-v2`, `az-log-retention`, `az-log-commitment-tier`, `az-log-review-ingestion`) | Expensive tables, plans, retention, commitment tiers |
 | Commitments | `az-commitment`, `az-advisor` | Stable compute baseline *after* other savings; Advisor recommendations as inputs |
 | Governance | `az-untagged` | Spend without owner/environment/cost-center tags |

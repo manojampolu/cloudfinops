@@ -49,7 +49,8 @@ class Register:
     # ------------------------------------------------------------------ ingest
 
     def record_run(self, provider: str, run_dir: str, period: tuple[str, str], window_spend: float,
-                   recs: list[Recommendation], est_savings: float, records: list[CostRecord]) -> int:
+                   recs: list[Recommendation], est_savings: float, records: list[CostRecord],
+                   mark_missing: bool = True) -> int:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         cur = self.db.execute(
             "INSERT INTO runs (created_at, provider, run_dir, period_start, period_end, window_spend, est_savings, findings)"
@@ -75,7 +76,7 @@ class Register:
             self.db.execute("INSERT OR IGNORE INTO decisions (key, status, updated_at) VALUES (?, 'open', ?)",
                             (r.key, now))
         # Findings that disappeared: keep, but mark inactive (resolved? or resource gone)
-        for row in self.db.execute("SELECT key FROM findings WHERE active=1").fetchall():
+        for row in self.db.execute("SELECT key FROM findings WHERE active=1").fetchall() if mark_missing else []:
             if row["key"] not in seen:
                 self.db.execute("UPDATE findings SET active=0 WHERE key=?", (row["key"],))
         self.db.executemany(
