@@ -74,6 +74,16 @@ cloudfinops demo --provider aws --out demo-aws       # full AWS assessment on bu
 cloudfinops demo                                     # classic AWS text report (collect/analyze flow)
 ```
 
+### Check before you run
+
+```bash
+cloudfinops check --provider aws --profile readonly     # or --provider azure / gcp
+```
+
+This takes 10–20 seconds and confirms the CLI is installed, you are signed in, and which data sources this identity
+can read (costs, inventory, metrics, recommendations). For anything missing it names the permission and the fix.
+It never signs in or changes anything. Exit code 0 means ready (possibly with gaps); 1 means not ready.
+
 ### Azure assessment
 
 ```bash

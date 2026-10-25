@@ -25,7 +25,7 @@ READ_VERBS = {
 # Interactive/local commands that are not reads but are safe and never touch cloud resources.
 LOCAL_COMMANDS = {
     ("az", "login"), ("az", "account", "set"), ("az", "extension", "add"), ("az", "version"),
-    ("aws", "sso", "login"), ("gcloud", "auth", "login"), ("gcloud", "config", "get"),
+    ("aws", "sso", "login"), ("gcloud", "auth", "login"), ("gcloud", "config", "get"), ("aws", "configure", "get"),
 }
 # POST endpoints that are reads (query APIs)
 READ_POST_PATHS = ("/providers/microsoft.costmanagement/query",)

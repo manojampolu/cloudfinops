@@ -2,6 +2,11 @@
 
 Use this on the first real run in each cloud, before showing results to a client.
 
+## 0. Before the run
+
+- [ ] `cloudfinops check --provider <aws|azure|gcp>` reports *Ready*. Fix every MISSING item you want covered
+      (usually a role/policy) before collecting.
+
 ## 1. Collection is complete
 
 - [ ] The report's **Data quality** section shows no `error` rows. Every `access` gap is understood: either expected
