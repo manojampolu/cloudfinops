@@ -1,0 +1,23 @@
+{
+  "provider": "aws",
+  "sample": true,
+  "subscriptions": [
+    {
+      "id": "444455556666",
+      "name": "acme-workloads",
+      "display_name": "acme-workloads"
+    }
+  ],
+  "regions": [
+    "us-east-1",
+    "eu-west-1"
+  ],
+  "period": {
+    "start": "2026-08-16",
+    "end": "2026-10-15"
+  },
+  "metric_days": 14,
+  "collected_at": "2026-10-15T06:00:00+00:00",
+  "errors": [],
+  "profile": "default"
+}

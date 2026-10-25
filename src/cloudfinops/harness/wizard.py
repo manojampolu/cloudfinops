@@ -48,7 +48,7 @@ def _pick(scopes: list[dict], provider, defaults: list[dict]) -> list[dict]:
 
 def collect_interactive(provider_name: str, out_root: Path, cfg: Config, subscriptions: list[str] | None = None,
                         device_code: bool = False, tenant: str | None = None, assume_yes: bool = False) -> Path:
-    provider = get_provider(provider_name)
+    provider = get_provider(provider_name, cfg)
     run_dir = Path(out_root) / f"{provider_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     runner = CliRunner(run_dir)
     print(f"cloudfinops read-only assessment · provider: {provider_name} · run folder: {run_dir}")
@@ -57,7 +57,7 @@ def collect_interactive(provider_name: str, out_root: Path, cfg: Config, subscri
     for p in list(problems):
         if p.startswith("missing-extension:"):
             ext = p.split(":", 1)[1]
-            if _yes(f"The Azure CLI extension '{ext}' is required (local install, no cloud change). Install it now?",
+            if _yes(f"The CLI extension '{ext}' is required (local install, no cloud change). Install it now?",
                     assume_yes=assume_yes):
                 provider.install_extension(runner, ext)
                 problems.remove(p)

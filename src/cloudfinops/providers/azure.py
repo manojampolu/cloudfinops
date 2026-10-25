@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import statistics
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from ..config import Config
+from ..harness.errors import is_permission_error, short_error
 from ..harness.runner import CliError, CliRunner
 from ..models import CostRecord, Dataset, Relationship, Resource
 from ..pricing_azure import PriceBook, vm_downsize, vm_memory_gb
@@ -62,9 +64,21 @@ TYPE_MAP = {
     "microsoft.containerregistry/registries": ("azure.acr", "Container Registries"),
     "microsoft.app/containerapps": ("azure.container_app", "Container Apps"),
     "microsoft.app/managedenvironments": ("azure.aca_env", "Container Apps Environments"),
+    "microsoft.network/azurefirewalls": ("azure.firewall", "Azure Firewall"),
+    "microsoft.network/bastionhosts": ("azure.bastion", "Azure Bastion"),
+    "microsoft.network/virtualnetworkgateways": ("azure.vnet_gateway", "VPN / ExpressRoute Gateways"),
+    "microsoft.network/connections": ("azure.vnet_connection", "Gateway Connections"),
+    "microsoft.network/ddosprotectionplans": ("azure.ddos_plan", "DDoS Protection Plans"),
+    "microsoft.dbforpostgresql/flexibleservers": ("azure.postgres_flex", "PostgreSQL Flexible Servers"),
+    "microsoft.dbformysql/flexibleservers": ("azure.mysql_flex", "MySQL Flexible Servers"),
+    "microsoft.sqlvirtualmachine/sqlvirtualmachines": ("azure.sql_vm", "SQL Server on VMs"),
+    "microsoft.sql/servers/elasticpools": ("azure.sql_pool", "SQL Elastic Pools"),
+    "microsoft.sql/managedinstances": ("azure.sql_mi", "SQL Managed Instances"),
 }
 # Types that normally carry no direct charge (used by data-quality checks)
-FREE_TYPES = {"azure.nic", "azure.vnet", "azure.nsg", "azure.web_app", "azure.sql_server"}
+FREE_TYPES = {"azure.nic", "azure.vnet", "azure.nsg", "azure.web_app", "azure.sql_server", "azure.vnet_connection",
+              "azure.sql_vm"}
+DB_FLEX_TYPES = ("azure.postgres_flex", "azure.mysql_flex")
 
 METRICS_BY_TYPE = {
     "azure.vm": ["Percentage CPU", "Available Memory Bytes"],
@@ -72,8 +86,15 @@ METRICS_BY_TYPE = {
     "azure.disk": ["Composite Disk Read Operations/sec", "Composite Disk Write Operations/sec"],
     "azure.app_service_plan": ["CpuPercentage", "MemoryPercentage"],
     "azure.container_app": ["UsageNanoCores", "Requests", "Replicas"],
+    "azure.postgres_flex": ["cpu_percent", "memory_percent", "active_connections"],
+    "azure.mysql_flex": ["cpu_percent", "memory_percent", "active_connections"],
+    "azure.firewall": ["DataProcessed"],
+    "azure.bastion": ["sessions"],
+    "azure.nat_gateway": ["ByteCount"],
 }
-AGGREGATIONS_BY_TYPE = {"azure.container_app": ("Average", "Maximum", "Total")}
+AGGREGATIONS_BY_TYPE = {"azure.container_app": ("Average", "Maximum", "Total"),
+                        "azure.firewall": ("Total",), "azure.nat_gateway": ("Total",),
+                        "azure.bastion": ("Average", "Maximum")}
 DEFAULT_AGGREGATIONS = ("Average", "Maximum")
 
 
@@ -151,13 +172,30 @@ class AzureProvider:
             "errors": [],
         }
 
+        def record(step: str, scope: str, exc: Exception) -> None:
+            log(f"  ! {step} ({scope}) failed: {short_error(str(exc))}")
+            manifest["errors"].append({"step": step, "scope": scope, "message": short_error(str(exc)),
+                                       "permission": is_permission_error(str(exc))})
+
         def guard(step: str, scope: str, fn):
             try:
                 return fn()
             except Exception as exc:  # record and keep going: a gap is evidence too
-                log(f"  ! {step} ({scope}) failed: {str(exc)[:200]}")
-                manifest["errors"].append({"step": step, "scope": scope, "message": str(exc)[:1000]})
+                record(step, scope, exc)
                 return None
+
+        names = {s["id"]: s.get("name", s["id"]) for s in scopes}
+        denied: dict[str, dict[str, str]] = defaultdict(dict)  # step -> {subscription: reason}
+
+        deny_lock = threading.Lock()  # metrics workers call deny() concurrently
+
+        def deny(step: str, sub: str, exc: Exception, what: str) -> None:
+            """Record one access gap per subscription and step, instead of one error per call."""
+            with deny_lock:
+                if sub in denied[step]:
+                    return
+                denied[step][sub] = short_error(str(exc))
+            log(f"  ! no {what} access in {names.get(sub, sub)}: skipping the rest of this step there")
 
         log("Collecting inventory (Azure Resource Graph)...")
         resources = guard("inventory", "all", lambda: self._graph(runner, INVENTORY_QUERY, sub_ids)) or []
@@ -165,6 +203,13 @@ class AzureProvider:
         containers = guard("inventory", "containers", lambda: self._graph(runner, CONTAINERS_QUERY, sub_ids)) or []
         runner.save_json("inventory/containers.json", containers)
         log(f"  {len(resources)} resources")
+        visible = defaultdict(int)
+        for r in resources:
+            visible[r.get("subscriptionId", "")] += 1
+        for sub in sub_ids:
+            if resources and not visible.get(sub):
+                denied["inventory"][sub] = ("no resources visible: the subscription is empty, or the identity lacks "
+                                            "Reader at subscription scope (Resource Graph hides what it cannot read)")
 
         log("Collecting costs (Cost Management, amortized)...")
         first_query = True
@@ -174,14 +219,20 @@ class AzureProvider:
                 continue
             for name, grouping in (("by_resource", ["ResourceId", "ServiceName"]),
                                    ("by_pricing_model", ["ServiceName", "PricingModel"])):
+                if sub in denied["costs"]:
+                    break
                 if not first_query and cfg.cost_query_pause_s > 0:
                     log(f"  pausing {cfg.cost_query_pause_s:.0f}s between Cost Management queries (rate limits)")
                     time.sleep(cfg.cost_query_pause_s)
                 first_query = False
-                data = guard("costs", f"{sub}:{name}",
-                             lambda: self._cost_query(runner, token, sub, start, end, grouping))
-                if data is not None:
+                try:
+                    data = self._cost_query(runner, token, sub, start, end, grouping)
                     runner.save_json(f"costs/{sub}_{name}.json", data)
+                except Exception as exc:
+                    if is_permission_error(str(exc)):
+                        deny("costs", sub, exc, "Cost Management")
+                    else:
+                        record("costs", f"{sub}:{name}", exc)
 
         log("Collecting Azure Advisor cost recommendations...")
         for sub in sub_ids:
@@ -190,44 +241,76 @@ class AzureProvider:
             if recs is not None:
                 runner.save_json(f"advisor/{sub}.json", recs)
 
+        log("Collecting Defender for Cloud plans...")
+        for sub in sub_ids:
+            plans = guard("defender", sub, lambda: runner.run(
+                ["az", "security", "pricing", "list", "--subscription", sub, "-o", "json"]))
+            if plans is not None:
+                runner.save_json(f"defender/{sub}.json", plans.get("value", plans) if isinstance(plans, dict) else plans)
+
         log("Collecting Log Analytics usage...")
         for ws in (r for r in resources if _lower(r.get("type")) == "microsoft.operationalinsights/workspaces"):
             cid = (ws.get("properties") or {}).get("customerId")
-            base = _safe_name(_lower(ws["id"]))
+            base, ws_sub = _safe_name(_lower(ws["id"])), ws.get("subscriptionId", "")
+            calls = []
             if cid:
-                usage = guard("logging", ws["name"], lambda: runner.run(
-                    ["az", "monitor", "log-analytics", "query", "-w", cid, "--analytics-query", LOG_USAGE_QUERY,
-                     "-o", "json"]))
-                if usage is not None:
-                    runner.save_json(f"logging/{base}_usage.json", {"workspace_id": _lower(ws["id"]), "rows": usage})
-            tables = guard("logging", ws["name"], lambda: runner.run(
-                ["az", "monitor", "log-analytics", "workspace", "table", "list", "-g", ws["resourceGroup"],
-                 "--workspace-name", ws["name"], "--subscription", ws["subscriptionId"], "-o", "json"]))
-            if tables is not None:
-                runner.save_json(f"logging/{base}_tables.json", {"workspace_id": _lower(ws["id"]), "tables": tables})
+                calls.append(("usage", ["az", "monitor", "log-analytics", "query", "-w", cid,
+                                        "--analytics-query", LOG_USAGE_QUERY, "-o", "json"]))
+            calls.append(("tables", ["az", "monitor", "log-analytics", "workspace", "table", "list", "-g",
+                                     ws["resourceGroup"], "--workspace-name", ws["name"], "--subscription", ws_sub,
+                                     "-o", "json"]))
+            for kind, cmd in calls:
+                if ws_sub in denied["logging"]:
+                    break
+                try:
+                    out = runner.run(cmd)
+                except Exception as exc:
+                    if is_permission_error(str(exc)):
+                        deny("logging", ws_sub, exc, "Log Analytics")
+                    else:
+                        record("logging", ws["name"], exc)
+                    continue
+                key = "rows" if kind == "usage" else "tables"
+                runner.save_json(f"logging/{base}_{kind}.json", {"workspace_id": _lower(ws["id"]), key: out})
 
         log("Collecting utilization metrics (Azure Monitor)...")
         targets = self._metric_targets(resources, runner.raw_dir, cfg)
         m_end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         m_start = m_end - timedelta(days=cfg.metric_days)
         done = 0
+        skipped = defaultdict(int)
+
+        def fetch(rid, names_, aggs):
+            sub = _sub_of(rid)
+            if sub in denied["metrics"]:
+                skipped[sub] += 1
+                return None
+            try:
+                return self._metrics(runner, rid, names_, m_start, m_end, aggs)
+            except Exception as exc:
+                if is_permission_error(str(exc)):
+                    deny("metrics", sub, exc, "Azure Monitor metrics")  # set in the worker so queued calls skip
+                    return None
+                raise
+
         with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(self._metrics, runner, rid, names, m_start, m_end, aggs): rid
-                       for rid, names, aggs in targets}
+            futures = {pool.submit(fetch, rid, names_, aggs): rid for rid, names_, aggs in targets}
             for fut in as_completed(futures):
                 rid = futures[fut]
                 try:
-                    runner.save_json(f"metrics/{_safe_name(rid)}.json", {"resource_id": rid, "response": fut.result()})
+                    resp = fut.result()
+                    if resp is not None:
+                        runner.save_json(f"metrics/{_safe_name(rid)}.json", {"resource_id": rid, "response": resp})
                 except Exception as exc:
-                    manifest["errors"].append({"step": "metrics", "scope": rid, "message": str(exc)[:500]})
+                    manifest["errors"].append({"step": "metrics", "scope": rid, "message": short_error(str(exc))})
                 done += 1
                 if done % 50 == 0:
                     log(f"  {done}/{len(targets)}")
         manifest["metrics_requested"] = len(targets)
         log(f"  metrics for {len(targets)} resources")
 
-        log("Looking up VM list prices (Azure Retail Prices API)...")
-        book = PriceBook(cache_dir=runner.raw_dir / "prices", online=True)
+        log("Looking up VM list prices (Azure Retail Prices API)..." if cfg.price_lookup else "VM price lookup disabled")
+        book = PriceBook(cache_dir=runner.raw_dir / "prices", online=cfg.price_lookup)
         sizes = set()
         for r in resources:
             if _lower(r.get("type")) == "microsoft.compute/virtualmachines":
@@ -237,9 +320,18 @@ class AzureProvider:
                     if (smaller := vm_downsize(size)):
                         sizes.add((smaller, r.get("location", "")))
         book.prefetch({(size, region) for size, region in sizes})
-        if not book.online:
+        if cfg.price_lookup and not book.online:
             manifest["errors"].append({"step": "prices", "scope": "prices.azure.com",
                                        "message": "Retail Prices API unreachable; fallback price table used"})
+
+        what = {"inventory": "Resource Graph", "costs": "Cost Management (needs Cost Management Reader)",
+                "logging": "Log Analytics (needs Log Analytics Reader)", "metrics": "Azure Monitor metrics (needs Reader)"}
+        for step, subs in denied.items():
+            for sub, reason in subs.items():
+                extra = f"; {skipped[sub]} metric request(s) skipped" if step == "metrics" and skipped.get(sub) else ""
+                manifest["errors"].append({"step": "access", "scope": names.get(sub, sub), "permission": True,
+                                           "message": f"{what[step]}: {reason}{extra}"})
+        manifest["access_gaps"] = {step: sorted(subs) for step, subs in denied.items() if subs}
 
         (runner.run_dir / "scope.json").write_text(json.dumps(manifest, indent=2))
         return manifest
@@ -308,6 +400,9 @@ class AzureProvider:
                 if not _lower((r.get("sku") or {}).get("name")).startswith("premium") or \
                         _lower(props.get("diskState")) != "attached":
                     continue
+            elif rtype in DB_FLEX_TYPES:
+                if _lower(props.get("state")) not in ("ready", "running", ""):
+                    continue
             elif rtype not in METRICS_BY_TYPE:
                 continue
             targets.append((cost[rid], rid, METRICS_BY_TYPE[rtype], AGGREGATIONS_BY_TYPE.get(rtype, DEFAULT_AGGREGATIONS)))
@@ -322,9 +417,9 @@ class AzureProvider:
                                "--start-time", start.isoformat(), "--end-time", end.isoformat(), "-o", "json"])
         try:
             return query(names)
-        except CliError:
-            if len(names) == 1:
-                raise
+        except CliError as exc:
+            if len(names) == 1 or is_permission_error(str(exc)):
+                raise  # one-by-one retry only helps when a single metric is unsupported
         # One unsupported metric (e.g. no guest memory on this VM size) fails the whole call: fetch one by one
         merged, last_error = None, None
         for name in names:
@@ -362,6 +457,8 @@ class AzureProvider:
         self._attach_metrics(raw, by_id, cfg)
         advisor = self._advisor(raw, by_id)
         log_usage = self._logging(raw, by_id)
+        defender = {f.stem: json.loads(f.read_text()) or [] for f in sorted((raw / "defender").glob("*.json"))} \
+            if (raw / "defender").exists() else {}
 
         if records:
             scope.setdefault("period", {})
@@ -373,7 +470,7 @@ class AzureProvider:
             scope=scope, currency=currency,
             extras={"pricing_model_daily": pricing_model, "advisor": advisor, "log_usage": log_usage,
                     "pricebook": PriceBook(cache_dir=raw / "prices", online=False),
-                    "subscription_names": sub_names, "free_types": FREE_TYPES},
+                    "subscription_names": sub_names, "free_types": FREE_TYPES, "defender": defender},
         )
 
     def _resource(self, r: dict, sub_names: dict) -> Resource:
@@ -405,6 +502,7 @@ class AzureProvider:
             a.update(vm_size=size, power_state=power.split("/")[-1] if power else "unknown",
                      state="running" if "running" in power else (power.split("/")[-1] or "unknown"),
                      os_type=(storage.get("osDisk") or {}).get("osType", ""),
+                     license_type=props.get("licenseType") or "",
                      priority=props.get("priority", "Regular"),
                      disk_ids=[_lower(d) for d in disks if d],
                      nic_ids=[_lower(n["id"]) for n in (props.get("networkProfile") or {}).get("networkInterfaces", [])],
@@ -470,6 +568,37 @@ class AzureProvider:
                      workload_profile=props.get("workloadProfileName") or "Consumption",
                      ingress="external" if ingress.get("external") else ("internal" if ingress else "none"),
                      scale_rules=sorted({k for rule in scale.get("rules") or [] for k in rule if k != "name"}))
+        elif rtype in DB_FLEX_TYPES:
+            storage = props.get("storage") or {}
+            res.sku = sku.get("name", "")
+            state = _lower(props.get("state"))
+            a.update(tier=sku.get("tier", ""), state="running" if state in ("ready", "running") else state or "unknown",
+                     storage_gb=storage.get("storageSizeGB"), version=props.get("version", ""),
+                     ha_mode=(props.get("highAvailability") or {}).get("mode", "Disabled"))
+        elif rtype == "azure.sql_vm":
+            a.update(license_type=props.get("sqlServerLicenseType", ""), edition=props.get("sqlImageSku", ""),
+                     vm_id=_lower(props.get("virtualMachineResourceId")))
+        elif rtype in ("azure.sql_db", "azure.sql_pool", "azure.sql_mi"):
+            a.update(tier=sku.get("tier", ""), vcores=sku.get("capacity") if sku.get("family") or rtype == "azure.sql_mi" else None,
+                     license_type=props.get("licenseType", ""), serverless="_S_" in str(sku.get("name", "")).upper())
+        elif rtype == "azure.firewall":
+            a.update(tier=((props.get("sku") or {}).get("tier") or ""),
+                     deallocated=not props.get("ipConfigurations") and not props.get("hubIPAddresses"))
+        elif rtype == "azure.bastion":
+            res.sku = sku.get("name", "Basic")
+        elif rtype == "azure.vnet_gateway":
+            a.update(gateway_type=props.get("gatewayType", ""), vpn_type=props.get("vpnType", ""),
+                     point_to_site=bool(props.get("vpnClientConfiguration")),
+                     gw_sku=(props.get("sku") or {}).get("name", ""))
+            res.sku = a["gw_sku"]
+        elif rtype == "azure.vnet_connection":
+            a.update(gateway_ids=[_lower((props.get(k) or {}).get("id")) for k in ("virtualNetworkGateway1", "virtualNetworkGateway2")
+                                  if (props.get(k) or {}).get("id")],
+                     status=props.get("connectionStatus", ""))
+        elif rtype == "azure.nat_gateway":
+            a["subnet_count"] = len(props.get("subnets") or [])
+        elif rtype == "azure.ddos_plan":
+            a["protected_vnets"] = [_lower(v.get("id")) for v in props.get("virtualNetworks") or []]
         elif rtype == "azure.log_workspace":
             res.sku = (props.get("sku") or {}).get("name", "")
             a.update(customer_id=props.get("customerId"), retention_days=props.get("retentionInDays", 30),
@@ -493,6 +622,12 @@ class AzureProvider:
                 rels += [Relationship(p, r.id, "ip_of") for p in a.get("public_ip_ids", [])]
             elif r.type == "azure.web_app" and a.get("server_farm_id"):
                 rels.append(Relationship(r.id, a["server_farm_id"], "uses_plan"))
+            elif r.type == "azure.sql_vm" and a.get("vm_id"):
+                rels.append(Relationship(r.id, a["vm_id"], "sql_on"))
+            elif r.type == "azure.vnet_connection":
+                rels += [Relationship(r.id, g, "connects") for g in a.get("gateway_ids", [])]
+            elif r.type == "azure.ddos_plan":
+                rels += [Relationship(r.id, v, "protects") for v in a.get("protected_vnets", [])]
             elif r.type == "azure.container_app" and a.get("environment_id"):
                 rels.append(Relationship(r.id, a["environment_id"], "runs_in"))
             elif r.type == "azure.snapshot" and a.get("source_id"):
@@ -566,7 +701,7 @@ class AzureProvider:
             m["metrics_window_days"] = cfg.metric_days
             expected = max(1, int(cfg.metric_days * 24 / hours))
 
-            cpu_name = "Percentage CPU" if "Percentage CPU" in series else "CpuPercentage"
+            cpu_name = next((n for n in ("Percentage CPU", "CpuPercentage", "cpu_percent") if n in series), "")
             if cpu_name in series:
                 avgs = [p["average"] for p in series[cpu_name] if p.get("average") is not None]
                 maxs = [p.get("maximum", p["average"]) for p in series[cpu_name] if p.get("average") is not None]
@@ -583,10 +718,19 @@ class AzureProvider:
                     m["mem_used_p95"] = _p95(used)
                 elif avail:
                     m["mem_available_min_gb"] = min(avail) / 1024 ** 3
-            if "MemoryPercentage" in series:
-                vals = [p["average"] for p in series["MemoryPercentage"] if p.get("average") is not None]
+            for mem_name in ("MemoryPercentage", "memory_percent"):
+                vals = [p["average"] for p in series.get(mem_name, []) if p.get("average") is not None]
                 if vals:
                     m["mem_used_p95"] = _p95(vals)
+            if "active_connections" in series:
+                vals = [p.get("maximum", p.get("average")) for p in series["active_connections"]
+                        if p.get("maximum", p.get("average")) is not None]
+                m["connections_max"] = max(vals, default=0.0)
+            for metric, key, scale in (("DataProcessed", "data_processed_gb", 1e9), ("ByteCount", "bytes_gb", 1e9)):
+                if metric in series:
+                    m[key] = sum(p.get("total") or 0.0 for p in series[metric]) / scale
+            if "sessions" in series:
+                m["sessions_max"] = max((p.get("maximum") or p.get("average") or 0.0 for p in series["sessions"]), default=0.0)
             disk_r = series.get("Composite Disk Read Operations/sec")
             disk_w = series.get("Composite Disk Write Operations/sec")
             if disk_r is not None or disk_w is not None:
@@ -642,6 +786,11 @@ class AzureProvider:
             if ws in by_id:
                 by_id[ws].attributes["ingest_gb_30d"] = sum(data["tables"].values())
         return dict(usage)
+
+
+def _sub_of(resource_id: str) -> str:
+    m = re.match(r"/subscriptions/([^/]+)", resource_id or "", re.I)
+    return m.group(1) if m else ""
 
 
 def _gib(value) -> float:

@@ -10,7 +10,7 @@ from . import aws, azure, gcp  # noqa: F401  (registers rules)
 from .base import RULES, Context, owner_of
 
 COMPUTE_RESOURCE_TYPES = {"azure.vm", "azure.vmss", "azure.aks", "azure.app_service_plan", "ec2_instance",
-                          "rds_instance", "gcp.vm", "gcp.run_service", "gcp.sql"}
+                          "rds_instance", "gcp.vm", "gcp.run_service", "gcp.sql", "azure.container_app"}
 COMMITMENT_RULES = {"az-commitment", "savings-plan"}
 
 
@@ -45,9 +45,36 @@ def run_rules(records: list[CostRecord], resources: list[Resource], cfg: Config,
             if not rec.related:
                 rec.related = list(res.related)
 
+    _apply_evidence_defaults(recs, ctx)
     _size_commitments_after_optimization(recs, cfg)
     recs.sort(key=lambda r: (-r.est_monthly_savings, SEVERITY_ORDER[r.severity], r.rule_id))
     return recs
+
+
+def _apply_evidence_defaults(recs: list[Recommendation], ctx: Context) -> None:
+    """Bring older rules up to the evidence model and flag estimate-based costs consistently."""
+    from ..models import CONFIDENCE_RANGE
+    from .aws import LEGACY_PROFILE
+
+    for rec in recs:
+        changed = False
+        if rec.rule_id in LEGACY_PROFILE and not rec.evidence:
+            conf, missing = LEGACY_PROFILE[rec.rule_id]
+            rec.confidence = conf
+            rec.missing_evidence = [*rec.missing_evidence, *missing]
+            rec.evidence = [rec.detail] if rec.detail else []
+            changed = True
+        res = ctx.by_id.get(rec.resource_id)
+        if res and res.cost_source == "estimate" and rec.est_monthly_savings > 0 and \
+                not any("estimate" in m.lower() for m in rec.missing_evidence):
+            rec.missing_evidence.append("Actual resource cost (list-price estimate used)")
+            changed = True
+        if changed:
+            if rec.missing_evidence and rec.confidence == "high":
+                rec.confidence = "medium"
+            lo, hi = CONFIDENCE_RANGE.get(rec.confidence, (0.0, 1.0))
+            if rec.savings_high is None or rec.savings_high <= rec.est_monthly_savings:
+                rec.savings_low, rec.savings_high = rec.est_monthly_savings * lo, rec.est_monthly_savings * hi
 
 
 def _size_commitments_after_optimization(recs: list[Recommendation], cfg: Config) -> None:

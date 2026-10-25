@@ -13,7 +13,7 @@ from datetime import timedelta
 
 from ..models import Recommendation, Resource
 from ..pricing_azure import disk_tier_price, vm_downsize
-from .base import Context, account_rule, make, owner_of, resource_rule
+from .base import Context, account_rule, is_non_prod, make, owner_of, resource_rule  # noqa: F401
 
 COMPUTE_TYPES = ("azure.vm", "azure.vmss")
 TAGGABLE = ("azure.vm", "azure.vmss", "azure.disk", "azure.app_service_plan", "azure.aks", "azure.log_workspace",
@@ -26,16 +26,6 @@ def _cost(res: Resource) -> float:
 
 def _money(v: float) -> str:
     return f"${v:,.2f}"
-
-
-def is_non_prod(res: Resource, ctx: Context) -> str | None:
-    """Return the reason a resource looks non-production, or None."""
-    env = res.tags.get("environment") or res.tags.get("env") or ""
-    if env:
-        return f"tag environment={env}" if env.lower() in ctx.cfg.non_prod_env_values else None
-    tokens = set(re.split(r"[-_.\s]+", f"{res.name} {res.group}".lower()))
-    hit = tokens & set(ctx.cfg.non_prod_name_tokens)
-    return f"name/resource group contains '{sorted(hit)[0]}'" if hit else None
 
 
 def _cost_evidence(res: Resource) -> str:
@@ -571,4 +561,356 @@ def untagged(ctx: Context) -> list[Recommendation]:
             action="Add owner/environment/cost-center tags; enforce with Azure Policy (require tag / inherit from RG).",
             validation_steps=["Agree a tagging standard with application owners"],
         ))
+    return recs
+
+
+# =========================================================================== licensing (Azure Hybrid Benefit)
+
+from ..pricing_azure import (  # noqa: E402
+    DDOS_IP_PROTECTION_MONTHLY, DEFENDER_SERVERS_MONTHLY, SQL_PAAS_LICENSE_VCORE_HOUR, SQL_VM_LICENSE_VCPU_HOUR,
+    WINDOWS_LICENSE_VCPU_HOUR, WINDOWS_LICENSE_VCPU_HOUR_B, parse_vm_size,
+)
+
+AHB_LICENCE_GAP = "Eligible licences with Software Assurance or subscriptions the client can assign to Azure"
+
+
+def _cap_to_billing(estimate: float, res: Resource, share: float = 0.5) -> float:
+    """Licence estimates from list prices are capped at a share of the actual bill when billing is known."""
+    return min(estimate, _cost(res) * share) if res.cost_source == "billing" else estimate
+
+
+@resource_rule("az-ahb-windows", "Windows VMs without Azure Hybrid Benefit", "azure.vm")
+def ahb_windows(res: Resource, ctx: Context):
+    a = res.attributes
+    if a.get("os_type", "").lower() != "windows" or a.get("license_type") in ("Windows_Server", "Windows_Client"):
+        return None
+    if a.get("state") != "running" and _cost(res) < 1:
+        return None
+    size = parse_vm_size(res.sku)
+    if not size:
+        return None
+    rate = WINDOWS_LICENSE_VCPU_HOUR_B if size["family"].startswith("b") else WINDOWS_LICENSE_VCPU_HOUR
+    uptime = res.metrics.get("uptime_share", 1.0)
+    est = _cap_to_billing(size["vcpu"] * rate * ctx.cfg.hours_per_month * uptime, res)
+    return make("az-ahb-windows", res, title=f"Apply Azure Hybrid Benefit to Windows VM ({res.sku})",
+                scenario_group=f"{res.id}|licence",  # licence savings add to rightsizing/scheduling of the same VM
+                category="licensing", est_monthly_savings=est, confidence="low", effort="low", risk="low",
+                evidence=["OS type Windows, licenseType not set (paying for the Windows licence)", _cost_evidence(res),
+                          f"{size['vcpu']} vCPU running {uptime:.0%} of hours"],
+                assumptions=[f"Windows licence component ~${rate}/vCPU-hour (list price)"],
+                missing_evidence=[AHB_LICENCE_GAP],
+                action="Set licence type to Windows_Server (az vm update --license-type Windows_Server); no restart needed.",
+                validation_steps=["Confirm licence entitlement with the licensing team before applying"])
+
+
+@resource_rule("az-ahb-sql-vm", "SQL Server VMs paying for the SQL licence", "azure.sql_vm")
+def ahb_sql_vm(res: Resource, ctx: Context):
+    a = res.attributes
+    edition = (a.get("edition") or "").lower()
+    if a.get("license_type") != "PAYG" or edition not in SQL_VM_LICENSE_VCPU_HOUR:
+        return None
+    vm = ctx.by_id.get(a.get("vm_id"))
+    size = parse_vm_size(vm.sku) if vm else None
+    if not vm or not size or vm.attributes.get("state") != "running":
+        return None
+    uptime = vm.metrics.get("uptime_share", 1.0)
+    est = size["vcpu"] * SQL_VM_LICENSE_VCPU_HOUR[edition] * ctx.cfg.hours_per_month * uptime
+    if vm.cost_source == "billing":
+        est = min(est, _cost(vm) * 0.7)
+    non_prod = is_non_prod(vm, ctx)
+    common = dict(est_monthly_savings=est, current_monthly_cost=vm.monthly_cost, effort="low",
+                  evidence=[f"SQL Server {a.get('edition')} on {vm.display_name} ({vm.sku}), licence PAYG",
+                            f"{size['vcpu']} vCPU running {uptime:.0%} of hours"],
+                  assumptions=[f"SQL {a.get('edition')} licence ~${SQL_VM_LICENSE_VCPU_HOUR[edition]}/vCPU-hour (list price)"],
+                  related=[vm.id])
+    if non_prod and edition in ("enterprise", "standard"):
+        return make("az-ahb-sql-vm", res, title=f"Use SQL Server Developer edition on non-prod VM {vm.display_name}",
+                    category="licensing", confidence="medium", risk="medium",
+                    missing_evidence=["Whether the database ever serves production traffic"],
+                    action="Reinstall/switch to SQL Server Developer edition (free for non-production) and set licence to DR/AHUB as applicable.",
+                    validation_steps=["Developer edition must not be used for production workloads"],
+                    **{**common, "evidence": [*common["evidence"], f"Classified non-production: {non_prod}"]})
+    return make("az-ahb-sql-vm", res, title=f"Apply Azure Hybrid Benefit to SQL Server {a.get('edition')} on {vm.display_name}",
+                category="licensing", confidence="low", missing_evidence=[AHB_LICENCE_GAP],
+                action="Set SQL licence type to AHUB (az sql vm update --license-type AHUB), or DR for passive replicas.",
+                validation_steps=["Confirm SQL Server core licences with Software Assurance are available"], **common)
+
+
+@resource_rule("az-ahb-sql-paas", "Azure SQL vCore databases / pools / MIs on licence-included pricing",
+               "azure.sql_db", "azure.sql_pool", "azure.sql_mi")
+def ahb_sql_paas(res: Resource, ctx: Context):
+    a = res.attributes
+    tier = (a.get("tier") or "").lower()
+    if a.get("license_type") != "LicenseIncluded" or not a.get("vcores") or a.get("serverless") or tier not in SQL_PAAS_LICENSE_VCORE_HOUR:
+        return None
+    est = _cap_to_billing(float(a["vcores"]) * SQL_PAAS_LICENSE_VCORE_HOUR[tier] * ctx.cfg.hours_per_month, res)
+    return make("az-ahb-sql-paas", res, title=f"Apply Azure Hybrid Benefit to {res.service[:-1]} ({a['vcores']} vCores, {a.get('tier')})",
+                category="licensing", est_monthly_savings=est, confidence="low", effort="low",
+                evidence=["licenseType = LicenseIncluded", f"{a['vcores']} vCores, tier {a.get('tier')}", _cost_evidence(res)],
+                assumptions=[f"SQL licence component ~${SQL_PAAS_LICENSE_VCORE_HOUR[tier]}/vCore-hour (list price)"],
+                missing_evidence=[AHB_LICENCE_GAP],
+                action="Set licence type to BasePrice (Azure Hybrid Benefit) on the database, pool or managed instance.")
+
+
+# =========================================================================== network appliances
+
+def _appliance_ev(res: Resource) -> str:
+    return f"{res.service} {res.sku or res.attributes.get('tier', '')}: {_cost_evidence(res)}".strip()
+
+
+@resource_rule("az-firewall", "Idle or non-production Azure Firewalls", "azure.firewall")
+def firewall(res: Resource, ctx: Context):
+    if _cost(res) < 1 or res.attributes.get("deallocated"):
+        return None
+    gb = res.metrics.get("data_processed_gb")
+    if gb is not None and gb < 1:
+        return make("az-firewall", res, title=f"Azure Firewall processed {gb * 1024:,.0f} MB in {ctx.cfg.metric_days} days",
+                    category="waste", est_monthly_savings=_cost(res), confidence="medium", risk="medium",
+                    evidence=[_appliance_ev(res), f"Data processed in window: {gb:.3f} GB"],
+                    action="Deallocate the firewall (keeps its configuration) or remove it if traffic now bypasses it.",
+                    validation_steps=["Check UDRs: a firewall with no traffic may mean routing was changed, not that it is unused"])
+    reason = is_non_prod(res, ctx)
+    if reason:
+        off = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
+        return make("az-firewall", res, title=f"Non-prod Azure Firewall ({res.attributes.get('tier') or 'Standard'}) runs 24/7",
+                    category="scheduling", est_monthly_savings=_cost(res) * off, confidence="low",
+                    evidence=[f"Classified non-production: {reason}", _appliance_ev(res)],
+                    assumptions=[f"Deallocated outside {ctx.cfg.non_prod_on_hours_per_week:.0f}h/week (deallocated firewalls are not billed)"],
+                    missing_evidence=["Agreed operating hours", "Whether a shared hub firewall or the Basic SKU would do"],
+                    action="Schedule deallocate/allocate (Azure PowerShell $fw.Deallocate()/Allocate()) or move to a shared hub / Basic SKU.")
+    return None
+
+
+@resource_rule("az-bastion", "Idle or non-production Azure Bastion hosts", "azure.bastion")
+def bastion(res: Resource, ctx: Context):
+    if _cost(res) < 1 or (res.sku or "").lower() == "developer":
+        return None
+    sessions = res.metrics.get("sessions_max")
+    if sessions is not None and sessions == 0:
+        return make("az-bastion", res, title=f"Azure Bastion ({res.sku}) had no sessions in {ctx.cfg.metric_days} days",
+                    category="waste", est_monthly_savings=_cost(res), confidence="medium",
+                    evidence=[_appliance_ev(res), "Max concurrent sessions: 0"],
+                    action="Delete it and redeploy on demand, or use the free Developer SKU for occasional access.")
+    reason = is_non_prod(res, ctx)
+    if reason:
+        return make("az-bastion", res, title=f"Non-prod Azure Bastion on {res.sku} SKU", category="waste",
+                    est_monthly_savings=_cost(res), confidence="low",
+                    evidence=[f"Classified non-production: {reason}", _appliance_ev(res)]
+                    + ([f"Max concurrent sessions: {sessions:.0f}"] if sessions is not None else []),
+                    missing_evidence=["Whether one connection at a time is enough (Developer SKU limitation)"],
+                    action="Switch to the Developer SKU (free) or share one Bastion from a hub VNet.")
+    return None
+
+
+@resource_rule("az-vnet-gateway-unused", "VPN / ExpressRoute gateways without connections", "azure.vnet_gateway")
+def vnet_gateway_unused(res: Resource, ctx: Context):
+    if _cost(res) < 1 or res.attributes.get("point_to_site"):
+        return None
+    conns = [r for r in ctx.resources if r.type == "azure.vnet_connection" and res.id in r.attributes.get("gateway_ids", [])]
+    if conns:
+        return None
+    return make("az-vnet-gateway-unused", res, title=f"{res.attributes.get('gateway_type') or 'Virtual network'} gateway ({res.sku}) has no connections",
+                category="waste", est_monthly_savings=_cost(res), confidence="medium",
+                evidence=[_appliance_ev(res), "No site-to-site / VNet-to-VNet / ExpressRoute connections", "No point-to-site configuration"],
+                missing_evidence=["Connections defined in other subscriptions are not visible to this assessment"],
+                action="Delete the gateway if the network link it served is retired (gateways bill hourly regardless of traffic).")
+
+
+@resource_rule("az-nat-idle", "NAT gateways with no subnets or no traffic", "azure.nat_gateway")
+def nat_idle(res: Resource, ctx: Context):
+    if _cost(res) < 1:
+        return None
+    no_subnets = res.attributes.get("subnet_count", 1) == 0
+    gb = res.metrics.get("bytes_gb")
+    if not no_subnets and (gb is None or gb > 0.01):
+        return None
+    return make("az-nat-idle", res, title="NAT gateway " + ("is not attached to any subnet" if no_subnets else "carried no traffic"),
+                category="waste", est_monthly_savings=_cost(res), confidence="high" if no_subnets else "medium",
+                evidence=[_appliance_ev(res), "Subnets: 0" if no_subnets else f"Traffic in window: {gb:.3f} GB"],
+                action="Delete the NAT gateway and its public IP if outbound access goes elsewhere.")
+
+
+@resource_rule("az-ddos-plan", "DDoS Network Protection plans", "azure.ddos_plan")
+def ddos_plan(res: Resource, ctx: Context):
+    if _cost(res) < 1:
+        return None
+    vnets = res.attributes.get("protected_vnets") or []
+    if not vnets:
+        return make("az-ddos-plan", res, title="DDoS Protection plan protects no virtual networks", category="waste",
+                    est_monthly_savings=_cost(res), confidence="high", evidence=[_appliance_ev(res), "Protected VNets: 0"],
+                    action="Delete the plan (it bills a fixed monthly fee per tenant plan).")
+    subs = {v.split("/resourcegroups/")[0] for v in vnets}
+    ips = [r for r in ctx.resources if r.type == "azure.public_ip" and any(r.id.startswith(s + "/") for s in subs)]
+    ip_cost = len(ips) * DDOS_IP_PROTECTION_MONTHLY
+    if ip_cost >= _cost(res) * 0.8:
+        return None
+    return make("az-ddos-plan", res, title=f"DDoS Network Protection for {len(ips)} public IP(s): consider DDoS IP Protection",
+                category="modernization", est_monthly_savings=_cost(res) - ip_cost, confidence="low",
+                evidence=[_appliance_ev(res), f"{len(vnets)} protected VNet(s), {len(ips)} public IP(s) in those subscriptions"],
+                assumptions=[f"IP Protection ~${DDOS_IP_PROTECTION_MONTHLY:.0f} per public IP per month"],
+                missing_evidence=["Need for DDoS Rapid Response and cost protection (Network Protection only)"],
+                action="Move to DDoS IP Protection on the public IPs that need it, then remove the plan.")
+
+
+# =========================================================================== PostgreSQL / MySQL flexible servers
+
+DB_FLEX = ("azure.postgres_flex", "azure.mysql_flex")
+DB_COMPUTE_SHARE = 0.85  # storage and backups keep billing when compute is reduced or stopped
+
+
+@resource_rule("az-db-flex-idle", "Flexible servers with no connections", *DB_FLEX)
+def db_flex_idle(res: Resource, ctx: Context):
+    if res.attributes.get("state") != "running" or res.metrics.get("connections_max") != 0 or _cost(res) < 1:
+        return None
+    return make("az-db-flex-idle", res, title=f"{res.service[:-1]} had no connections in {ctx.cfg.metric_days} days ({res.sku})",
+                category="waste", est_monthly_savings=_cost(res), confidence="medium", risk="medium",
+                evidence=["Max active connections: 0", _cost_evidence(res)],
+                action="Take a final backup and delete it, or stop it (servers restart automatically after 7 days).")
+
+
+@resource_rule("az-db-flex-rightsize", "Over-provisioned flexible servers", *DB_FLEX)
+def db_flex_rightsize(res: Resource, ctx: Context):
+    m, cfg, a = res.metrics, ctx.cfg, res.attributes
+    if a.get("state") != "running" or "cpu_p95" not in m or (a.get("tier") or "").lower() == "burstable":
+        return None
+    if m.get("connections_max") == 0 or m["cpu_p95"] >= cfg.rightsize_cpu_p95_pct or m["cpu_avg"] >= cfg.rightsize_cpu_avg_pct:
+        return None
+    mem = m.get("mem_used_p95")
+    if mem is not None and mem >= cfg.rightsize_mem_p95_pct:
+        return None
+    target = vm_downsize(res.sku)
+    if not target:
+        return None
+    return make("az-db-flex-rightsize", res, title=f"Downsize {res.service[:-1]} {res.sku} -> {target}", category="rightsizing",
+                est_monthly_savings=_cost(res) * DB_COMPUTE_SHARE * 0.5, confidence="high" if mem is not None else "low",
+                effort="medium", risk="medium",
+                evidence=[f"CPU avg {m['cpu_avg']:.0f}%, p95 {m['cpu_p95']:.0f}% over {cfg.metric_days} days",
+                          *([f"Memory p95 {mem:.0f}%"] if mem is not None else []),
+                          f"Max connections {m.get('connections_max', 0):.0f}", _cost_evidence(res)],
+                assumptions=[f"Compute is ~{DB_COMPUTE_SHARE:.0%} of the bill; one size down halves it"],
+                missing_evidence=[] if mem is not None else ["Memory utilization"],
+                action=f"Scale compute to {target} in a maintenance window (brief restart).",
+                validation_steps=["Check IOPS limits of the smaller size and month-end peaks"])
+
+
+@resource_rule("az-db-flex-nonprod-ha", "Non-production flexible servers with high availability", *DB_FLEX)
+def db_flex_nonprod_ha(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    if not reason or (res.attributes.get("ha_mode") or "Disabled") == "Disabled" or _cost(res) < 1:
+        return None
+    return make("az-db-flex-nonprod-ha", res, title=f"Non-prod {res.service[:-1]} has {res.attributes['ha_mode']} high availability",
+                category="waste", est_monthly_savings=_cost(res) * DB_COMPUTE_SHARE * 0.5, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", f"High availability: {res.attributes['ha_mode']}",
+                          _cost_evidence(res)],
+                assumptions=["The HA standby doubles compute cost"],
+                action="Disable high availability on non-production servers.")
+
+
+@resource_rule("az-db-flex-nonprod-stop", "Non-production flexible servers running 24/7", *DB_FLEX)
+def db_flex_nonprod_stop(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    m = res.metrics
+    if not reason or res.attributes.get("state") != "running" or m.get("uptime_share", 0) < ctx.cfg.scheduling_min_uptime_share:
+        return None
+    if m.get("connections_max") == 0:
+        return None  # idle rule covers it
+    off = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
+    return make("az-db-flex-nonprod-stop", res, title=f"Stop non-prod {res.service[:-1]} outside working hours",
+                category="scheduling", est_monthly_savings=_cost(res) * DB_COMPUTE_SHARE * off, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", f"Running {m['uptime_share']:.0%} of hours", _cost_evidence(res)],
+                assumptions=["Stopped servers bill only storage", "Servers restart after 7 days stopped, so stop on a schedule"],
+                missing_evidence=["Agreed operating hours"],
+                action="Schedule az postgres/mysql flexible-server stop/start (Automation or Logic App).")
+
+
+# =========================================================================== VM scale sets (not AKS)
+
+@resource_rule("az-vmss-idle", "VM scale sets with near-zero CPU", "azure.vmss")
+def vmss_idle(res: Resource, ctx: Context):
+    m = res.metrics
+    if res.attributes.get("aks_pool") or "cpu_max" not in m or m["cpu_max"] >= ctx.cfg.idle_cpu_max_pct or _cost(res) < 1:
+        return None
+    return make("az-vmss-idle", res, title=f"Idle VM scale set ({res.attributes.get('capacity')} x {res.sku})",
+                category="waste", est_monthly_savings=_cost(res), confidence="medium", risk="medium",
+                evidence=[_cpu_evidence(res), _cost_evidence(res)],
+                missing_evidence=["Network activity not evaluated"],
+                action="Scale to 0 instances or delete the scale set after confirming with the owner.")
+
+
+@resource_rule("az-vmss-rightsize", "Over-provisioned VM scale sets", "azure.vmss")
+def vmss_rightsize(res: Resource, ctx: Context):
+    m, cfg = res.metrics, ctx.cfg
+    if res.attributes.get("aks_pool") or "cpu_p95" not in m or m["cpu_max"] < cfg.idle_cpu_max_pct:
+        return None
+    if m["cpu_p95"] >= cfg.rightsize_cpu_p95_pct or m["cpu_avg"] >= cfg.rightsize_cpu_avg_pct:
+        return None
+    target = vm_downsize(res.sku)
+    cap = int(res.attributes.get("capacity") or 1)
+    if target:
+        title, action = f"Downsize scale set {res.sku} -> {target}", f"Change the scale set SKU to {target} and roll instances."
+    elif cap > 1:
+        target = None
+        title, action = f"Reduce scale set from {cap} instances", "Lower the instance count or add CPU-based autoscale rules."
+    else:
+        return None
+    return make("az-vmss-rightsize", res, title=title, category="rightsizing", est_monthly_savings=_cost(res) * 0.5,
+                confidence="low", effort="medium", risk="medium",
+                evidence=[_cpu_evidence(res), f"Capacity {cap}", _cost_evidence(res)],
+                assumptions=["One size down (or half the instances) halves compute"],
+                missing_evidence=["Guest memory utilization (not collected for scale sets)"],
+                action=action, validation_steps=["Check autoscale settings and peak load"])
+
+
+# =========================================================================== Defender for Cloud
+
+def _is_non_prod_name(name: str, ctx: Context) -> str | None:
+    tokens = set(re.split(r"[-_.\s]+", (name or "").lower()))
+    hit = tokens & (set(ctx.cfg.non_prod_name_tokens) | set(ctx.cfg.non_prod_env_values))
+    return sorted(hit)[0] if hit else None
+
+
+@account_rule("az-defender-nonprod", "Paid Defender for Cloud plans on non-production subscriptions", provider="azure")
+def defender_nonprod(ctx: Context) -> list[Recommendation]:
+    recs = []
+    names = ctx.extras.get("subscription_names", {})
+    for sub, plans in (ctx.extras.get("defender") or {}).items():
+        token = _is_non_prod_name(names.get(sub, ""), ctx)
+        paid = [p for p in plans if (p.get("pricingTier") or "").lower() == "standard"]
+        if not token or not paid:
+            continue
+        spend = sum(r.cost for r in ctx.records if r.account == sub and "defender" in r.service.lower())
+        days = len({r.day for r in ctx.records}) or 30
+        monthly = spend / days * 30 if spend else None
+        servers = [p for p in paid if p.get("name") == "VirtualMachines"]
+        sub_plan = (servers[0].get("subPlan") or "P2").lower() if servers else ""
+        plan_list = ", ".join(sorted(f"{p['name']}{(' ' + p['subPlan']) if p.get('subPlan') else ''}" for p in paid))
+        base = dict(account=sub, category="licensing", resource_name=names.get(sub, sub), service="Defender for Cloud",
+                    scenario_group=f"__defender_{sub}", current_monthly_cost=monthly,
+                    evidence=[f"Subscription '{names.get(sub, sub)}' classified non-production ('{token}')",
+                              f"Paid plans: {plan_list}"]
+                    + ([f"Defender spend ~{_money(monthly)}/mo"] if monthly else []))
+        if sub_plan == "p2":
+            vms = [r for r in ctx.resources if r.account == sub and r.type == "azure.vm" and r.attributes.get("state") == "running"]
+            vmss = sum(int(r.attributes.get("capacity") or 0) for r in ctx.resources if r.account == sub and r.type == "azure.vmss")
+            n = len(vms) + vmss
+            saving = n * (DEFENDER_SERVERS_MONTHLY["p2"] - DEFENDER_SERVERS_MONTHLY["p1"])
+            if saving:
+                recs.append(Recommendation(
+                    rule_id="az-defender-nonprod", resource_id=f"/subscriptions/{sub}/defender/servers",
+                    title=f"Defender for Servers P2 on non-prod subscription ({n} servers): use P1",
+                    est_monthly_savings=saving, confidence="medium",
+                    assumptions=[f"P2 ${DEFENDER_SERVERS_MONTHLY['p2']:.0f} vs P1 ${DEFENDER_SERVERS_MONTHLY['p1']:.0f} per server/month"],
+                    missing_evidence=["Security team's required controls for non-production"],
+                    action="Switch Defender for Servers to Plan 1 on this subscription (or disable it for short-lived dev VMs).",
+                    validation_steps=["Agree with security; P2 adds file integrity monitoring, JIT, vulnerability assessment"],
+                    **base))
+                continue
+        recs.append(Recommendation(
+            rule_id="az-defender-nonprod", resource_id=f"/subscriptions/{sub}/defender/plans",
+            title=f"Review {len(paid)} paid Defender plan(s) on non-prod subscription",
+            est_monthly_savings=0.0, savings_low=0.0, savings_high=(monthly or 0.0) * 0.5, confidence="low",
+            assumptions=["Upper bound: half of Defender spend on this subscription"],
+            missing_evidence=["Security team's required controls for non-production"],
+            action="Disable plans not needed in non-production (e.g. Storage, Key Vault, App Service, Containers).",
+            **base))
     return recs

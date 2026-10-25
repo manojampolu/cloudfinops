@@ -1,0 +1,1 @@
+[{"name":"VirtualMachines","pricingTier":"Standard","subPlan":"P2"},{"name":"KeyVaults","pricingTier":"Standard","subPlan":"PerKeyVault"},{"name":"AppServices","pricingTier":"Standard"}]

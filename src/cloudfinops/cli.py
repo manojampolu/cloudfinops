@@ -41,9 +41,9 @@ def cmd_analyze(args) -> int:
 
 def cmd_demo(args) -> int:
     samples = pkg_resources.files("cloudfinops") / "samples"
-    if args.provider == "azure":
-        with pkg_resources.as_file(samples / "azure") as run_dir:
-            out = Path(args.out or "demo-azure")
+    if args.provider in ("azure", "aws"):
+        with pkg_resources.as_file(samples / args.provider) as run_dir:
+            out = Path(args.out or f"demo-{args.provider}")
             return _assess_run_dir(Path(run_dir), out, args, register=out / "register.db")
     with pkg_resources.as_file(samples / "billing.csv") as b, pkg_resources.as_file(samples / "inventory.json") as i:
         return _analyze(b, i, args)
@@ -56,9 +56,8 @@ def _assess_run_dir(run_dir: Path, out_dir: Path, args, register: Path | None) -
     cfg = Config.load(args.config)
     if getattr(args, "lookback_days", None):
         cfg.lookback_days = args.lookback_days
-    if getattr(args, "billing_table", None):
-        cfg.gcp_billing_table = args.billing_table
-    provider = get_provider(getattr(args, "provider", None) or _provider_of(run_dir))
+    _apply_args(cfg, args)
+    provider = get_provider(getattr(args, "provider", None) or _provider_of(run_dir), cfg)
     ds = provider.load(run_dir, cfg)
     groups = getattr(args, "resource_groups", None) or cfg.resource_groups
     if groups:
@@ -90,10 +89,16 @@ def _provider_of(run_dir: Path) -> str:
     return json.loads(scope.read_text()).get("provider", "azure") if scope.exists() else "azure"
 
 
+def _apply_args(cfg: Config, args) -> Config:
+    for arg, field_name in (("billing_table", "gcp_billing_table"), ("profile", "aws_profile"),
+                            ("regions", "aws_regions"), ("billing_csv", "aws_billing_csv")):
+        if getattr(args, arg, None):
+            setattr(cfg, field_name, getattr(args, arg))
+    return cfg
+
+
 def cmd_assess(args) -> int:
-    cfg = Config.load(args.config)
-    if getattr(args, "billing_table", None):
-        cfg.gcp_billing_table = args.billing_table
+    cfg = _apply_args(Config.load(args.config), args)
     if args.from_run:
         run_dir = Path(args.from_run)
         if not (run_dir / "raw").is_dir():
@@ -156,17 +161,27 @@ def cmd_collect(args) -> int:
     from .providers import aws
 
     out = Path(args.out_dir)
+    failed = False
     if not args.skip_costs:
-        records = aws.collect_costs(days=args.days, group_by=args.group_by, profile=args.profile)
-        write_billing_csv(records, out / "billing.csv")
-        print(f"Wrote {len(records)} cost records to {out / 'billing.csv'}", file=sys.stderr)
+        try:
+            records = aws.collect_costs(days=args.days, group_by=args.group_by, profile=args.profile)
+            write_billing_csv(records, out / "billing.csv")
+            print(f"Wrote {len(records)} cost records to {out / 'billing.csv'}", file=sys.stderr)
+        except ValueError as exc:  # access denied / Cost Explorer not enabled: still collect the inventory
+            print(f"error: costs not collected: {exc}", file=sys.stderr)
+            failed = True
     if not args.skip_inventory:
-        resources = aws.collect_inventory(regions=args.regions, profile=args.profile, include_s3=not args.skip_s3)
+        gaps: dict = {}
+        resources = aws.collect_inventory(regions=args.regions, profile=args.profile, include_s3=not args.skip_s3,
+                                          gaps=gaps)
         write_inventory(resources, out / "inventory.json")
         print(f"Wrote {len(resources)} resources to {out / 'inventory.json'}", file=sys.stderr)
+        if gaps.get("denied"):
+            print(f"Not collected (access denied): {', '.join(gaps['denied'])}. Grant ReadOnlyAccess to include them.",
+                  file=sys.stderr)
     print(f"Next: cloudfinops analyze --billing {out / 'billing.csv'} --inventory {out / 'inventory.json'}",
           file=sys.stderr)
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_rules(args) -> int:
@@ -197,16 +212,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_analyze)
 
     p = sub.add_parser("demo", help="run analysis on bundled sample data")
-    p.add_argument("--provider", choices=["aws", "azure"], default="aws")
-    p.add_argument("--out", help="azure: output folder (default ./demo-azure)")
+    p.add_argument("--provider", choices=["aws", "azure"],
+                   help="run the full assessment pipeline on sample data (omit for the classic AWS text report)")
+    p.add_argument("--out", help="output folder for --provider (default ./demo-<provider>)")
     _report_args(p)
     p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("assess", help="read-only assessment: login, collect, analyze, report")
-    p.add_argument("--provider", choices=["azure", "gcp"], help="default azure; with --from, read from the run folder")
+    p.add_argument("--provider", choices=["aws", "azure", "gcp"],
+                   help="default azure; with --from, read from the run folder")
     p.add_argument("--subscriptions", "--projects", dest="subscriptions", nargs="*",
                    help="subscription/project ids or names (default: pick interactively)")
     p.add_argument("--billing-table", help="gcp: BigQuery billing export table project.dataset.table")
+    p.add_argument("--profile", help="aws: named CLI profile")
+    p.add_argument("--regions", nargs="*", help="aws: regions to scan (default: all enabled)")
+    p.add_argument("--billing-csv", help="aws: CUR / FOCUS CSV export for resource-level costs")
     p.add_argument("--resource-groups", nargs="*", metavar="RG",
                    help="azure: report only on these resource groups (case-insensitive); output goes to rg-<names>/")
     p.add_argument("--tenant", help="tenant id/domain to sign in to")

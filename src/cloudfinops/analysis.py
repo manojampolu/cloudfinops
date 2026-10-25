@@ -181,13 +181,15 @@ def _estimate(res: Resource, cfg: Config) -> float | None:
     if res.type.startswith("gcp."):
         from .pricing_gcp import estimate_monthly as gcp_estimate
         return gcp_estimate(res, cfg.hours_per_month)
+    if res.type.startswith("aws."):
+        return pricing.estimate_aws(res, cfg.hours_per_month)
     a = res.attributes
     h = cfg.hours_per_month
     match res.type:
         case "ec2_instance":
             if a.get("state") != "running":
                 return 0.0
-            return pricing.ec2_monthly(a.get("instance_type", ""), h)
+            return pricing.ec2_monthly_any(a.get("instance_type", ""), h)
         case "ebs_volume":
             return pricing.ebs_monthly(a.get("volume_type", "gp2"), float(a.get("size_gb", 0)))
         case "ebs_snapshot":
@@ -197,7 +199,9 @@ def _estimate(res: Resource, cfg: Config) -> float | None:
         case "load_balancer":
             return pricing.ALB_HOURLY * h
         case "rds_instance":
-            return pricing.rds_monthly(a.get("instance_class", ""), bool(a.get("multi_az")), h)
+            if a.get("state", "running") != "running":
+                return 0.0
+            return pricing.rds_monthly_any(a.get("instance_class", ""), bool(a.get("multi_az")), h)
         case "s3_bucket":
             return pricing.S3_STANDARD_GB_MONTH * float(a.get("standard_gb", 0))
     return None

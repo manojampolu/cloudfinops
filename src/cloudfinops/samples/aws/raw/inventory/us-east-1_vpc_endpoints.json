@@ -1,0 +1,1 @@
+{"VpcEndpoints":[{"VpcEndpointId":"vpce-1","VpcId":"vpc-prod","VpcEndpointType":"Interface","ServiceName":"com.amazonaws.us-east-1.ecr.api"}]}

@@ -1,0 +1,1 @@
+[{"Firewall":{"FirewallName":"nfw-dev","FirewallArn":"arn:aws:network-firewall:us-east-1:444455556666:firewall/nfw-dev","VpcId":"vpc-dev","SubnetMappings":[{"SubnetId":"s1"},{"SubnetId":"s2"}],"Tags":[{"Key":"environment","Value":"dev"}]}}]

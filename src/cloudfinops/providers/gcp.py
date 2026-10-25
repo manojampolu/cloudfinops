@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from ..config import Config
+from ..harness.errors import is_permission_error, short_error  # noqa: F401  (re-exported)
 from ..harness.runner import CliError, CliRunner
 from ..models import CostRecord, Dataset, Relationship, Resource
 from ..pricing_gcp import FX_TO_USD, machine_memory_gb, machine_type_short, parse_cpu, parse_mem_gib
@@ -44,6 +45,10 @@ DETAIL_LISTS = [  # (required API, raw name, command)
     ("logging.googleapis.com", "log_buckets", ["gcloud", "logging", "buckets", "list"]),
     ("sqladmin.googleapis.com", "sql_instances", ["gcloud", "sql", "instances", "list"]),
     ("container.googleapis.com", "gke_clusters", ["gcloud", "container", "clusters", "list"]),
+    ("compute.googleapis.com", "compute_routers", ["gcloud", "compute", "routers", "list"]),
+    ("compute.googleapis.com", "forwarding_rules", ["gcloud", "compute", "forwarding-rules", "list"]),
+    ("compute.googleapis.com", "vpn_tunnels", ["gcloud", "compute", "vpn-tunnels", "list"]),
+    ("compute.googleapis.com", "migs", ["gcloud", "compute", "instance-groups", "managed", "list"]),
 ]
 STORAGE_APIS = {"storage-api.googleapis.com", "storage.googleapis.com", "storage-component.googleapis.com"}
 
@@ -67,7 +72,21 @@ METRICS = {  # name: (filter, days, alignment seconds, aligner, reducer, group-b
                   ["resource.label.bucket_name", "metric.label.storage_class"], "storage"),
     "log_ingest": ('metric.type="logging.googleapis.com/billing/bytes_ingested"', 30, 86400, "ALIGN_DELTA",
                    "REDUCE_SUM", ["metric.label.resource_type"], "logging.googleapis.com"),
+    "sql_cpu": ('metric.type="cloudsql.googleapis.com/database/cpu/utilization"', 14, 3600, "ALIGN_MEAN", None, [],
+                "sqladmin.googleapis.com"),
+    "sql_mem": ('metric.type="cloudsql.googleapis.com/database/memory/utilization"', 14, 3600, "ALIGN_MEAN", None, [],
+                "sqladmin.googleapis.com"),
+    "sql_conn_mysql": ('metric.type="cloudsql.googleapis.com/database/network/connections"', 14, 86400, "ALIGN_MAX",
+                       None, [], "sqladmin.googleapis.com"),
+    "sql_conn_pg": ('metric.type="cloudsql.googleapis.com/database/postgresql/num_backends"', 14, 86400, "ALIGN_MAX",
+                    None, [], "sqladmin.googleapis.com"),
+    "nat_bytes": ('metric.type="router.googleapis.com/nat/sent_bytes_count"', 30, 86400, "ALIGN_DELTA", "REDUCE_SUM",
+                  ["resource.label.gateway_name", "resource.label.region", "resource.label.router_id"],
+                  "compute.googleapis.com"),
+    "lb_requests": ('metric.type="loadbalancing.googleapis.com/https/request_count"', 30, 86400, "ALIGN_DELTA",
+                    "REDUCE_SUM", ["resource.label.forwarding_rule_name"], "compute.googleapis.com"),
 }
+SQL_ADMIN_DATABASES = {"cloudsqladmin", "template0", "template1"}
 
 ASSET_SERVICE = {
     "compute.googleapis.com": "Compute Engine", "run.googleapis.com": "Cloud Run",
@@ -91,8 +110,10 @@ TYPE_SERVICE = {
     "gcp.snapshot": "Disk Snapshots", "gcp.run_service": "Cloud Run", "gcp.function": "Cloud Functions",
     "gcp.bucket": "Cloud Storage", "gcp.artifact_repo": "Artifact Registry", "gcp.log_bucket": "Cloud Logging",
     "gcp.sql": "Cloud SQL", "gcp.gke": "GKE", "gcp.api": "APIs & services",
+    "gcp.cloud_nat": "Cloud NAT", "gcp.forwarding_rule": "Load Balancer Forwarding Rules",
+    "gcp.vpn_tunnel": "Cloud VPN Tunnels", "gcp.mig": "Managed Instance Groups",
 }
-FREE_TYPES = {"gcp.api", "gcp.log_bucket", "gcp.function"}
+FREE_TYPES = {"gcp.api", "gcp.log_bucket", "gcp.function", "gcp.mig", "gcp.cloud_nat"}
 
 
 def _short(url: str) -> str:
@@ -122,21 +143,6 @@ def _point_value(p: dict) -> float:
     if "distributionValue" in v:
         return float(v["distributionValue"].get("mean", 0))
     return 0.0
-
-
-def is_permission_error(msg: str) -> bool:
-    m = msg.lower()
-    return "permission" in m or "(403)" in m or "forbidden" in m
-
-
-def short_error(msg: str) -> str:
-    """First meaningful line of a gcloud / HTTP error, without the echoed command or JSON body."""
-    m = re.search(r'"message":\s*"([^"]+)"', msg)
-    if m:
-        return m.group(1)[:200]
-    m = re.search(r"ERROR: \([^)]*\)\s*(.*)", msg, re.S)
-    text = m.group(1) if m else msg
-    return " ".join(text.split())[:200]
 
 
 def _p95(values: list[float]) -> float:
@@ -236,8 +242,8 @@ class GcpProvider:
             log(f"  skipping {len(no_access)} project(s) this account cannot read: {', '.join(no_access)}")
             manifest["no_access"] = no_access
             manifest["errors"].append({"step": "access", "scope": ", ".join(no_access), "permission": True,
-                                       "message": f"{len(no_access)} project(s) are visible but not readable by this "
-                                                  "account (grant roles/viewer to include them)"})
+                                       "message": f"{len(no_access)} project(s) visible but not readable, not assessed "
+                                                  "(grant roles/viewer to include them)"})
             projects = [p for p in projects if p not in no_access]
             manifest["subscriptions"] = [s for s in scopes if s["id"] not in no_access]
         cfg_project = guard("config", "core/project", lambda: runner.run(
@@ -455,7 +461,9 @@ class GcpProvider:
                             "memory_gb": machine_memory_gb(mt),
                             "spot": (r.get("scheduling") or {}).get("provisioningModel") == "SPOT",
                             "disk_ids": [_from_self_link(d.get("source", "")) for d in r.get("disks", [])],
-                            "created": _ts(r.get("creationTimestamp")), "stopped_since": _ts(r.get("lastStopTimestamp"))}))
+                            "created": _ts(r.get("creationTimestamp")), "stopped_since": _ts(r.get("lastStopTimestamp")),
+                            "mig": _short(next((i.get("value", "") for i in (r.get("metadata") or {}).get("items", [])
+                                                if i.get("key") == "created-by" and "instanceGroupManagers" in i.get("value", "")), ""))}))
         for r in rows("compute_disks"):
             zone = _short(r.get("zone", "") or r.get("region", ""))
             add(Resource(
@@ -560,7 +568,40 @@ class GcpProvider:
                 group=r.get("region", ""), tags={k.lower(): v for k, v in (settings.get("userLabels") or {}).items()},
                 attributes={"state": "running" if r.get("state") == "RUNNABLE" and settings.get("activationPolicy") != "NEVER" else "stopped",
                             "version": r.get("databaseVersion", ""), "availability": settings.get("availabilityType", ""),
-                            "disk_gb": float(settings.get("dataDiskSizeGb", 0) or 0)}))
+                            "disk_gb": float(settings.get("dataDiskSizeGb", 0) or 0), "edition": settings.get("edition", ""),
+                            "activation_policy": settings.get("activationPolicy", "ALWAYS"),
+                            "database_id": f"{p}:{r['name']}"}))
+        for r in rows("compute_routers"):
+            region = _short(r.get("region", ""))
+            for nat in r.get("nats") or []:
+                add(Resource(
+                    id=f"//compute.googleapis.com/projects/{p}/regions/{region}/routers/{r['name']}/nats/{nat['name']}".lower(),
+                    type="gcp.cloud_nat", provider="gcp", account=p, name=nat["name"], region=region, group=region,
+                    sku=nat.get("natIpAllocateOption", ""),
+                    attributes={"router": r["name"], "router_id": str(r.get("id", "")),
+                                "ranges": nat.get("sourceSubnetworkIpRangesToNat", "")}))
+        for r in rows("forwarding_rules"):
+            region = _short(r.get("region", "")) or "global"
+            target = _short(r.get("target", ""))
+            add(Resource(
+                id=_from_self_link(r["selfLink"]), type="gcp.forwarding_rule", provider="gcp", account=p, name=r["name"],
+                region=region, group=region, sku=r.get("loadBalancingScheme", ""),
+                tags={k.lower(): v for k, v in (r.get("labels") or {}).items()},
+                attributes={"target": target, "port_range": r.get("portRange", ""), "ip": r.get("IPAddress", ""),
+                            "http": "targetHttp" in r.get("target", "")}))
+        for r in rows("vpn_tunnels"):
+            region = _short(r.get("region", ""))
+            add(Resource(
+                id=_from_self_link(r["selfLink"]), type="gcp.vpn_tunnel", provider="gcp", account=p, name=r["name"],
+                region=region, group=region, sku=r.get("status", ""),
+                attributes={"status": r.get("status", ""), "detail": r.get("detailedStatus", ""), "peer_ip": r.get("peerIp", "")}))
+        for r in rows("migs"):
+            loc = _short(r.get("zone", "") or r.get("region", ""))
+            add(Resource(
+                id=_from_self_link(r["selfLink"]), type="gcp.mig", provider="gcp", account=p, name=r["name"],
+                region=_region_of(loc), group=loc, sku=_short(r.get("instanceTemplate", "")),
+                attributes={"target_size": int(r.get("targetSize") or 0),
+                            "autoscaled": bool((r.get("status") or {}).get("autoscaler"))}))
         for r in rows("gke_clusters"):
             add(Resource(
                 id=f"//container.googleapis.com/projects/{p}/locations/{r.get('location')}/clusters/{r['name']}".lower(),
@@ -580,6 +621,10 @@ class GcpProvider:
         funcs = {(r.account, r.name): r for r in by_id.values() if r.type == "gcp.function"}
         buckets = {r.name: r for r in by_id.values() if r.type == "gcp.bucket"}
         apis = {(r.account, r.name): r for r in by_id.values() if r.type == "gcp.api"}
+        sqls = {r.attributes.get("database_id"): r for r in by_id.values() if r.type == "gcp.sql"}
+        nats = {(r.account, r.region, r.name): r for r in by_id.values() if r.type == "gcp.cloud_nat"}
+        rules = {(r.account, r.name): r for r in by_id.values() if r.type == "gcp.forwarding_rule"}
+        sql_series: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
         vm_series: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 
         for f in sorted((raw / "metrics").glob("*.json")) if (raw / "metrics").exists() else []:
@@ -618,6 +663,21 @@ class GcpProvider:
                         b.attributes.setdefault("classes", {})[ml.get("storage_class", "")] = round(gb, 3)
                 elif name == "log_ingest":
                     extras["log_ingest"].setdefault(p, {})[ml.get("resource_type", "other")] = sum(values) / 1024 ** 3
+                elif name.startswith("sql_"):
+                    if rl.get("database_id") not in sqls:
+                        continue
+                    if name == "sql_conn_pg" and ml.get("database") in SQL_ADMIN_DATABASES:
+                        sql_series[rl["database_id"]].setdefault(name, [])  # measured; admin connections don't count
+                        continue
+                    sql_series[rl["database_id"]][name] += values
+                elif name == "nat_bytes":
+                    nat = nats.get((p, rl.get("region"), rl.get("gateway_name")))
+                    if nat:
+                        nat.metrics["processed_gb_30d"] = nat.metrics.get("processed_gb_30d", 0) + sum(values) / 1e9
+                elif name == "lb_requests":
+                    fr = rules.get((p, rl.get("forwarding_rule_name")))
+                    if fr:
+                        fr.metrics["requests_30d"] = fr.metrics.get("requests_30d", 0) + sum(values)
             # metric collected but nothing returned -> zero usage is real evidence
             if name == "run_requests":
                 for (rp, _, _), svc in runs.items():
@@ -627,12 +687,31 @@ class GcpProvider:
                 for (fp, _), fn in funcs.items():
                     if fp == p:
                         fn.metrics.setdefault("executions_30d", 0.0)
+            elif name == "lb_requests":
+                for (fp, _), fr in rules.items():
+                    if fp == p and fr.attributes.get("http"):
+                        fr.metrics.setdefault("requests_30d", 0.0)
+            elif name == "nat_bytes":
+                for (np_, _, _), nat in nats.items():
+                    if np_ == p:
+                        nat.metrics.setdefault("processed_gb_30d", 0.0)
             elif name == "api_requests":
                 extras["api_metrics_projects"].add(p)
                 for (ap, _), api in apis.items():
                     if ap == p:
                         api.metrics.setdefault("requests_30d", 0.0)
 
+        for db_id, series in sql_series.items():
+            m = sqls[db_id].metrics
+            cpu = [v * 100 for v in series.get("sql_cpu", [])]
+            if cpu:
+                m.update(cpu_avg=statistics.fmean(cpu), cpu_p95=_p95(cpu), cpu_max=max(cpu),
+                         uptime_share=min(1.0, len(cpu) / (14 * 24)), metrics_window_days=14)
+            if series.get("sql_mem"):
+                m["mem_used_p95"] = _p95([v * 100 for v in series["sql_mem"]])
+            conns = series.get("sql_conn_mysql", []) + series.get("sql_conn_pg", [])
+            if "sql_conn_mysql" in series or "sql_conn_pg" in series:
+                m["connections_max"] = max(conns, default=0.0)
         for rid, series in vm_series.items():
             vm, m = by_id[rid], by_id[rid].metrics
             mean = [v * 100 for v in series.get("vm_cpu_mean", [])]
@@ -650,6 +729,11 @@ class GcpProvider:
             a = r.attributes
             if r.type == "gcp.vm":
                 rels += [Relationship(d, r.id, "attached_to") for d in a.get("disk_ids", [])]
+                if a.get("mig"):
+                    mig = next((m for m in resources if m.type == "gcp.mig" and m.account == r.account
+                                and m.name == a["mig"]), None)
+                    if mig:
+                        rels.append(Relationship(r.id, mig.id, "member_of"))
             elif r.type == "gcp.address":
                 rels += [Relationship(r.id, u, "ip_of") for u in a.get("users", [])]
             elif r.type == "gcp.snapshot" and a.get("source_id"):

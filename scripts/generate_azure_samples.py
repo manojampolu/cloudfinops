@@ -45,6 +45,10 @@ T_VMSS, T_AKS = "microsoft.compute/virtualmachinescalesets", "microsoft.containe
 T_LAW, T_SA = "microsoft.operationalinsights/workspaces", "microsoft.storage/storageaccounts"
 T_KV = "microsoft.keyvault/vaults"
 T_ACA, T_ENV = "microsoft.app/containerapps", "microsoft.app/managedenvironments"
+T_FW, T_BAS, T_VGW = "microsoft.network/azurefirewalls", "microsoft.network/bastionhosts", "microsoft.network/virtualnetworkgateways"
+T_CONN, T_DDOS, T_NAT = "microsoft.network/connections", "microsoft.network/ddosprotectionplans", "microsoft.network/natgateways"
+T_VNET, T_PG, T_MY = "microsoft.network/virtualnetworks", "microsoft.dbforpostgresql/flexibleservers", "microsoft.dbformysql/flexibleservers"
+T_SQLVM, T_SQLSRV, T_SQLDB = "microsoft.sqlvirtualmachine/sqlvirtualmachines", "microsoft.sql/servers", "microsoft.sql/servers/databases"
 
 ARM_TYPE = {T_VM: "Microsoft.Compute/virtualMachines", T_DISK: "Microsoft.Compute/disks",
             T_SNAP: "Microsoft.Compute/snapshots", T_NIC: "Microsoft.Network/networkInterfaces",
@@ -53,7 +57,13 @@ ARM_TYPE = {T_VM: "Microsoft.Compute/virtualMachines", T_DISK: "Microsoft.Comput
             T_SITE: "Microsoft.Web/sites", T_VMSS: "Microsoft.Compute/virtualMachineScaleSets",
             T_AKS: "Microsoft.ContainerService/managedClusters", T_LAW: "Microsoft.OperationalInsights/workspaces",
             T_SA: "Microsoft.Storage/storageAccounts", T_KV: "Microsoft.KeyVault/vaults",
-            T_ACA: "Microsoft.App/containerApps", T_ENV: "Microsoft.App/managedEnvironments"}
+            T_ACA: "Microsoft.App/containerApps", T_ENV: "Microsoft.App/managedEnvironments",
+            T_FW: "Microsoft.Network/azureFirewalls", T_BAS: "Microsoft.Network/bastionHosts",
+            T_VGW: "Microsoft.Network/virtualNetworkGateways", T_CONN: "Microsoft.Network/connections",
+            T_DDOS: "Microsoft.Network/ddosProtectionPlans", T_NAT: "Microsoft.Network/natGateways",
+            T_VNET: "Microsoft.Network/virtualNetworks", T_PG: "Microsoft.DBforPostgreSQL/flexibleServers",
+            T_MY: "Microsoft.DBforMySQL/flexibleServers", T_SQLVM: "Microsoft.SqlVirtualMachine/sqlVirtualMachines",
+            T_SQLSRV: "Microsoft.Sql/servers", T_SQLDB: "Microsoft.Sql/servers/databases"}
 
 
 def rid(sub, rg, rtype, name):
@@ -84,7 +94,7 @@ def disk(sub, rg, name, gb, sku="Premium_LRS", attached_to=None, tags=None, iops
 
 
 def vm(sub, rg, name, size, cpu_avg=None, mem_used=None, power="running", tags=None, data_disks=(), disk_sku="Premium_LRS",
-       data_iops=None, os_gb=128, reserved=False, pip=False):
+       data_iops=None, os_gb=128, reserved=False, pip=False, os_type="Linux", license=None, extra_hourly=0.0):
     vm_id = rid(sub[0], rg, T_VM, name)
     os_disk = disk(sub, rg, f"{name}_OsDisk_1", os_gb, disk_sku, vm_id, tags)
     datas = [disk(sub, rg, f"{name}-data{i + 1}", gb, disk_sku, vm_id, tags, iops=data_iops)
@@ -97,11 +107,12 @@ def vm(sub, rg, name, size, cpu_avg=None, mem_used=None, power="running", tags=N
                      service="Virtual Network", cost_day=PUBLIC_IP_HOURLY * 24)
         ip_cfg["properties"]["publicIPAddress"] = {"id": pip_id}
     add(sub, rg, T_NIC, f"{name}-nic", {"virtualMachine": {"id": vm_id}, "ipConfigurations": [ip_cfg]}, tags=tags)
-    hourly = VM_HOURLY[size.lower()]
+    hourly = VM_HOURLY[size.lower()] + extra_hourly
     compute = 0.0 if power == "deallocated" else hourly * 24 * (0.6 if reserved else 1.0)
     add(sub, rg, T_VM, name, {
         "hardwareProfile": {"vmSize": size},
-        "storageProfile": {"osDisk": {"osType": "Linux", "managedDisk": {"id": os_disk}},
+        **({"licenseType": license} if license else {}),
+        "storageProfile": {"osDisk": {"osType": os_type, "managedDisk": {"id": os_disk}},
                            "dataDisks": [{"lun": i, "managedDisk": {"id": d}} for i, d in enumerate(datas)]},
         "networkProfile": {"networkInterfaces": [{"id": nic_id}]},
         "extended": {"instanceView": {"powerState": {"code": f"PowerState/{power}"}}},
@@ -247,6 +258,68 @@ def build():
     container_app(NONPROD, "rg-dev-app", dev_env, "ca-dev-portal", 0.5, 1, 1, 4, 1.1, dev_tags,
                   {"cpu": 15, "replicas": 1, "requests_per_h": 40})
 
+    # ---- licensing: Windows + SQL Server VMs, Azure SQL Database
+    for i in (1, 2):
+        vm(PROD, "rg-erp", f"vm-win-erp-{i:02d}", "Standard_D4s_v5", cpu_avg=45, mem_used=60, os_type="Windows",
+           tags=prod_tags("erp", "erp-team"), extra_hourly=4 * 0.046)
+    sqlwin = vm(PROD, "rg-db", "vm-sqlwin-01", "Standard_E4s_v5", cpu_avg=40, mem_used=70, os_type="Windows",
+                license="Windows_Server", tags={"owner": "data-team", "environment": "prod"}, extra_hourly=4 * 0.375)
+    add(PROD, "rg-db", T_SQLVM, "vm-sqlwin-01", {"virtualMachineResourceId": sqlwin, "sqlServerLicenseType": "PAYG",
+        "sqlImageSku": "Enterprise", "sqlImageOffer": "SQL2022-WS2022"}, tags={"owner": "data-team"})
+    sqldev = vm(NONPROD, "rg-dev-data", "vm-sql-dev-01", "Standard_D4s_v5", cpu_avg=25, mem_used=50, os_type="Windows",
+                tags=dev_tags, extra_hourly=4 * (0.046 + 0.10))
+    add(NONPROD, "rg-dev-data", T_SQLVM, "vm-sql-dev-01", {"virtualMachineResourceId": sqldev,
+        "sqlServerLicenseType": "PAYG", "sqlImageSku": "Standard"}, tags=dev_tags)
+    srv = add(PROD, "rg-db", T_SQLSRV, "sql-acme-prod", {}, tags={"owner": "data-team"})
+    add(PROD, "rg-db", T_SQLDB, "sql-acme-prod/sqldb-orders", {"licenseType": "LicenseIncluded"},
+        {"name": "GP_Gen5", "tier": "GeneralPurpose", "family": "Gen5", "capacity": 8}, {"owner": "api-team"},
+        service="SQL Database", cost_day=8 * 0.505 * 24)
+    add(PROD, "rg-db", T_SQLDB, "sql-acme-prod/sqldb-reports", {"licenseType": ""},
+        {"name": "GP_S_Gen5", "tier": "GeneralPurpose", "family": "Gen5", "capacity": 2}, {"owner": "data-team"},
+        service="SQL Database", cost_day=6.0)
+
+    # ---- network appliances
+    hub = add(PROD, "rg-network", T_VNET, "vnet-hub-prod", {}, tags={"owner": "network-team"})
+    add(PROD, "rg-network", T_DDOS, "ddos-plan-acme", {"virtualNetworks": [{"id": hub}]}, tags={"owner": "network-team"},
+        service="Azure DDOS Protection", cost_day=2944 / 30)
+    fw = add(PROD, "rg-network", T_FW, "afw-legacy-dmz", {"sku": {"name": "AZFW_VNet", "tier": "Standard"},
+             "ipConfigurations": [{"name": "ip"}]}, tags={"owner": "network-team"}, service="Azure Firewall", cost_day=1.25 * 24)
+    metrics[fw.lower()] = {"kind": "fw", "gb_per_6h": 0.004}
+    fw = add(NONPROD, "rg-hub-nonprod", T_FW, "afw-hub-nonprod", {"sku": {"name": "AZFW_VNet", "tier": "Standard"},
+             "ipConfigurations": [{"name": "ip"}]}, tags={"owner": "network-team"}, service="Azure Firewall", cost_day=1.25 * 24)
+    metrics[fw.lower()] = {"kind": "fw", "gb_per_6h": 6}
+    bas = add(PROD, "rg-network", T_BAS, "bas-prod", {}, {"name": "Basic"}, {"owner": "network-team"},
+              service="Azure Bastion", cost_day=0.19 * 24)
+    metrics[bas.lower()] = {"kind": "bastion", "sessions": 0}
+    bas = add(NONPROD, "rg-hub-nonprod", T_BAS, "bas-dev", {}, {"name": "Standard"}, {"owner": "network-team"},
+              service="Azure Bastion", cost_day=0.29 * 24)
+    metrics[bas.lower()] = {"kind": "bastion", "sessions": 2}
+    add(PROD, "rg-network", T_VGW, "vgw-old-branch", {"gatewayType": "Vpn", "vpnType": "RouteBased",
+        "sku": {"name": "VpnGw1", "tier": "VpnGw1"}}, tags={"owner": "network-team"}, service="VPN Gateway", cost_day=0.19 * 24)
+    vgw = add(PROD, "rg-network", T_VGW, "vgw-hub", {"gatewayType": "Vpn", "vpnType": "RouteBased",
+              "sku": {"name": "VpnGw1", "tier": "VpnGw1"}}, tags={"owner": "network-team"}, service="VPN Gateway", cost_day=0.19 * 24)
+    add(PROD, "rg-network", T_CONN, "conn-hq", {"virtualNetworkGateway1": {"id": vgw}, "connectionStatus": "Connected"},
+        tags={"owner": "network-team"})
+    add(PROD, "rg-network", T_NAT, "ng-unused", {"subnets": []}, {"name": "Standard"}, {"owner": "network-team"},
+        service="NAT Gateway", cost_day=0.045 * 24)
+
+    # ---- PostgreSQL / MySQL flexible servers
+    pg = add(NONPROD, "rg-dev-data", T_PG, "psql-dev-orders", {"state": "Ready", "version": "16",
+             "storage": {"storageSizeGB": 256}, "highAvailability": {"mode": "ZoneRedundant"}},
+             {"name": "Standard_D4ds_v4", "tier": "GeneralPurpose"}, dev_tags, service="Azure Database for PostgreSQL",
+             cost_day=0.355 * 24 * 2 + 1.0)
+    metrics[pg.lower()] = {"kind": "dbflex", "cpu": 8, "mem": 30, "connections": 12}
+    my = add(PROD, "rg-legacy", T_MY, "mysql-legacy-cms", {"state": "Ready", "version": "8.0.21",
+             "storage": {"storageSizeGB": 128}, "highAvailability": {"mode": "Disabled"}},
+             {"name": "Standard_D2ds_v4", "tier": "GeneralPurpose"}, {"owner": "finance-it"},
+             service="Azure Database for MySQL", cost_day=0.171 * 24 + 0.5)
+    metrics[my.lower()] = {"kind": "dbflex", "cpu": 2, "mem": 20, "connections": 0}
+
+    # ---- standalone VM scale set
+    vmss = add(PROD, "rg-render", T_VMSS, "vmss-render", {}, {"name": "Standard_D8s_v5", "capacity": 4},
+               prod_tags("render", "media-team"), service="Virtual Machines", cost_day=VM_HOURLY["standard_d8s_v5"] * 24 * 4)
+    metrics[vmss.lower()] = {"kind": "vm", "cpu": 7, "mem": None, "mem_gb": None}
+
     add(NONPROD, "rg-dev-monitoring", T_LAW, "law-dev", {"customerId": "aaaaaaaa-0000-0000-0000-000000000002",
         "retentionInDays": 30, "sku": {"name": "PerGB2018"}}, tags=dev_tags, service="Log Analytics")
 
@@ -286,6 +359,9 @@ def cost_rows():
         if n < 20:  # resource deleted mid-period -> unmapped in inventory
             gone = f"/subscriptions/{PROD[0]}/resourcegroups/rg-migration/providers/microsoft.compute/virtualmachines/vm-migrate-temp"
             by_sub[PROD[0]].append([round(0.384 * 24, 4), ud, gone, "Virtual Machines", "USD"])
+        nonprod_def = round(14.0 * rnd.uniform(0.98, 1.02), 4)
+        by_sub[NONPROD[0]].append([nonprod_def, ud, "", "Microsoft Defender for Cloud", "USD"])
+        agg[(NONPROD[0], "Microsoft Defender for Cloud", "OnDemand")] = nonprod_def
         defender = round(28.0 * rnd.uniform(0.98, 1.02), 4)
         by_sub[PROD[0]].append([defender, ud, "", "Microsoft Defender for Cloud", "USD"])
         agg[(PROD[0], "Microsoft Defender for Cloud", "OnDemand")] = defender
@@ -323,6 +399,20 @@ def metric_payload(spec):
     elif spec["kind"] == "disk":
         value.append(series("Composite Disk Read Operations/sec", "CountPerSecond", spec["iops"] * 0.6, cap=1e6))
         value.append(series("Composite Disk Write Operations/sec", "CountPerSecond", spec["iops"] * 0.4, cap=1e6))
+    elif spec["kind"] == "fw":
+        data = [{"timeStamp": ts.isoformat().replace("+00:00", "Z"),
+                 "total": round(spec["gb_per_6h"] * 1e9 * rnd.uniform(0.5, 1.5))} for ts in stamps]
+        value.append({"name": {"value": "DataProcessed"}, "unit": "Bytes", "timeseries": [{"data": data}]})
+    elif spec["kind"] == "bastion":
+        data = [{"timeStamp": ts.isoformat().replace("+00:00", "Z"), "average": spec["sessions"] * 0.4,
+                 "maximum": spec["sessions"] if rnd.random() < 0.3 else 0} for ts in stamps]
+        value.append({"name": {"value": "sessions"}, "unit": "Count", "timeseries": [{"data": data}]})
+    elif spec["kind"] == "dbflex":
+        value.append(series("cpu_percent", "Percent", spec["cpu"]))
+        value.append(series("memory_percent", "Percent", spec["mem"], spread=(0.9, 1.1), peak=1.1))
+        conn = [{"timeStamp": ts.isoformat().replace("+00:00", "Z"), "average": spec["connections"] * 0.6,
+                 "maximum": spec["connections"]} for ts in stamps]
+        value.append({"name": {"value": "active_connections"}, "unit": "Count", "timeseries": [{"data": conn}]})
     elif spec["kind"] == "aca":
         data_nano, data_req, data_rep = [], [], []
         for ts in stamps:
@@ -348,7 +438,7 @@ def main():
     if OUT.exists():
         shutil.rmtree(OUT)
     raw = OUT / "raw"
-    for d in ("inventory", "costs", "metrics", "advisor", "logging", "prices"):
+    for d in ("inventory", "costs", "metrics", "advisor", "logging", "prices", "defender"):
         (raw / d).mkdir(parents=True, exist_ok=True)
 
     w = lambda p, data: (raw / p).write_text(json.dumps(data, separators=(",", ":")))  # noqa: E731
@@ -385,6 +475,13 @@ def main():
                                "vmSize": "Standard_D4s_v5", "qty": "20"}})
     w(f"advisor/{PROD[0]}.json", advisor)
     w(f"advisor/{NONPROD[0]}.json", [])
+    (raw / "defender").mkdir(exist_ok=True)
+    w(f"defender/{PROD[0]}.json", [{"name": "VirtualMachines", "pricingTier": "Standard", "subPlan": "P2"},
+                                   {"name": "StorageAccounts", "pricingTier": "Standard", "subPlan": "DefenderForStorageV2"},
+                                   {"name": "KeyVaults", "pricingTier": "Free"}])
+    w(f"defender/{NONPROD[0]}.json", [{"name": "VirtualMachines", "pricingTier": "Standard", "subPlan": "P2"},
+                                      {"name": "KeyVaults", "pricingTier": "Standard", "subPlan": "PerKeyVault"},
+                                      {"name": "AppServices", "pricingTier": "Standard"}])
 
     for r in resources:
         if r["type"] != T_LAW:

@@ -1,0 +1,1 @@
+{"Addresses":[{"AllocationId":"eipalloc-00000000000000038","PublicIp":"54.10.0.1"},{"AllocationId":"eipalloc-00000000000000039","PublicIp":"54.10.0.2"},{"AllocationId":"eipalloc-0000000000000003a","PublicIp":"54.10.0.3"},{"AllocationId":"eipalloc-0000000000000003b","PublicIp":"54.10.0.9","AssociationId":"eipassoc-1","InstanceId":"i-0000000000000000c"}]}

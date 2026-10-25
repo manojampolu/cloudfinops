@@ -1,0 +1,1 @@
+{"VpnConnections":[{"VpnConnectionId":"vpn-0oldbranch","State":"available","Type":"ipsec.1","VgwTelemetry":[{"Status":"DOWN"},{"Status":"DOWN"}],"Tags":[{"Key":"Name","Value":"vpn-old-branch"}]},{"VpnConnectionId":"vpn-0hq","State":"available","Type":"ipsec.1","VgwTelemetry":[{"Status":"UP"},{"Status":"DOWN"}],"Tags":[{"Key":"Name","Value":"vpn-hq"}]}]}

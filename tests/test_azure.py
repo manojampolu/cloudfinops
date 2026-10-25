@@ -342,3 +342,58 @@ def test_retry_after_headers():
     assert _retry_after({"x-ms-ratelimit-microsoft.costmanagement-entity-retry-after": "37"}) == 37.0
     assert _retry_after({"Retry-After": "5"}) == 5.0
     assert _retry_after({}) is None
+
+
+# ---------------------------------------------------------------- licensing, network, databases, VMSS, Defender
+
+def _by_rule(findings, rule_id):
+    return {r.resource_name: r for r in findings if r.rule_id == rule_id}
+
+
+def test_hybrid_benefit_rules(findings):
+    win = _by_rule(findings, "az-ahb-windows")
+    assert {"vm-win-erp-01", "vm-win-erp-02", "vm-sql-dev-01"} <= set(win)
+    assert "vm-sqlwin-01" not in win  # already Windows_Server licence
+    assert not any(n.startswith(("vm-web", "vm-api")) for n in win)  # Linux
+    assert win["vm-win-erp-01"].est_monthly_savings == pytest.approx(4 * 0.046 * 730, rel=0.01)
+    assert win["vm-win-erp-01"].needs_validation  # licence entitlement unknown
+
+    sql = _by_rule(findings, "az-ahb-sql-vm")
+    assert "Hybrid Benefit" in sql["vm-sqlwin-01"].title and sql["vm-sqlwin-01"].confidence == "low"
+    assert "Developer edition" in sql["vm-sql-dev-01"].title
+
+    paas = _by_rule(findings, "az-ahb-sql-paas")
+    assert set(paas) == {"sql-acme-prod/sqldb-orders"}  # serverless reports DB excluded
+
+
+def test_network_appliance_rules(findings):
+    fw = _by_rule(findings, "az-firewall")
+    assert fw["afw-legacy-dmz"].category == "waste" and fw["afw-hub-nonprod"].category == "scheduling"
+    bas = _by_rule(findings, "az-bastion")
+    assert "no sessions" in bas["bas-prod"].title and "Non-prod" in bas["bas-dev"].title
+    assert set(_by_rule(findings, "az-vnet-gateway-unused")) == {"vgw-old-branch"}  # vgw-hub has a connection
+    assert set(_by_rule(findings, "az-nat-idle")) == {"ng-unused"}
+    ddos = _by_rule(findings, "az-ddos-plan")["ddos-plan-acme"]
+    assert "IP Protection" in ddos.title and 0 < ddos.est_monthly_savings < ddos.current_monthly_cost
+
+
+def test_flexible_server_rules(findings):
+    assert set(_by_rule(findings, "az-db-flex-idle")) == {"mysql-legacy-cms"}
+    for rule in ("az-db-flex-rightsize", "az-db-flex-nonprod-ha", "az-db-flex-nonprod-stop"):
+        assert "psql-dev-orders" in _by_rule(findings, rule), rule
+    assert "Standard_D2ds_v4" in _by_rule(findings, "az-db-flex-rightsize")["psql-dev-orders"].title
+
+
+def test_vmss_rules_skip_aks_pools(findings):
+    rs = _by_rule(findings, "az-vmss-rightsize")
+    assert set(rs) == {"vmss-render"}
+    assert not any("aks-" in n for n in _by_rule(findings, "az-vmss-idle"))
+
+
+def test_defender_nonprod(dataset, findings):
+    assert set(dataset.extras["defender"]) == {"11111111-aaaa-4aaa-8aaa-111111111111", "22222222-bbbb-4bbb-8bbb-222222222222"}
+    d = _by_rule(findings, "az-defender-nonprod")
+    assert set(d) == {"acme-nonprod"}  # the prod subscription keeps P2
+    rec = d["acme-nonprod"]
+    servers = int(rec.title.split("(")[1].split()[0])
+    assert rec.est_monthly_savings == pytest.approx(servers * 10)
