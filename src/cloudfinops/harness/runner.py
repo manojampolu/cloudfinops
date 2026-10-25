@@ -126,7 +126,15 @@ class CliRunner:
         while True:
             started = time.monotonic()
             if interactive:
-                proc = subprocess.run(cmd_exec, timeout=self.timeout * 2)
+                try:
+                    proc = subprocess.run(cmd_exec, timeout=self.timeout * 2)
+                except subprocess.TimeoutExpired as exc:
+                    self._log({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "cmd": shlex.join(cmd),
+                               "exit": -1, "duration_s": round(time.monotonic() - started, 2), "output": "",
+                               "bytes": 0, "attempt": attempt + 1})
+                    raise CliError(cmd, -1, f"no response after {self.timeout * 2}s; the sign-in was not completed. "
+                                            "Sign in yourself (e.g. gcloud auth login / az login / aws sso login) "
+                                            "and run the command again.") from exc
                 stdout, stderr = "", ""
             else:
                 proc = subprocess.run(cmd_exec, capture_output=True, text=True, timeout=self.timeout,

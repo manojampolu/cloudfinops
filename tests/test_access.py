@@ -184,3 +184,15 @@ def test_aws_cost_explorer_errors_are_readable(monkeypatch):
     monkeypatch.setattr(aws, "_session", lambda profile: FakeAwsSession(ce_error=unavailable))
     with pytest.raises(ValueError, match="Enable Cost Explorer"):
         aws.collect_costs()
+
+
+def test_interactive_login_timeout_is_a_clean_error(tmp_path, monkeypatch):
+    import subprocess
+    from cloudfinops.harness.runner import CliRunner
+
+    def hang(*a, **k):
+        raise subprocess.TimeoutExpired(cmd=a[0], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    with pytest.raises(CliError, match="sign-in was not completed"):
+        CliRunner(tmp_path, timeout=1).run(["gcloud", "auth", "login"], interactive=True)

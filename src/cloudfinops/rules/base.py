@@ -7,6 +7,7 @@ Two kinds of rules:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable
@@ -69,6 +70,16 @@ def account_rule(rule_id: str, description: str, provider: str = "aws"):
     return deco
 
 
+def is_non_prod(res: Resource, ctx: Context) -> str | None:
+    """Return the reason a resource looks non-production, or None."""
+    env = res.tags.get("environment") or res.tags.get("env") or ""
+    if env:
+        return f"tag environment={env}" if env.lower() in ctx.cfg.non_prod_env_values else None
+    tokens = set(re.split(r"[-_.\s]+", f"{res.name} {res.group}".lower()))
+    hit = tokens & set(ctx.cfg.non_prod_name_tokens)
+    return f"name/resource group contains '{sorted(hit)[0]}'" if hit else None
+
+
 def owner_of(res: Resource | None, cfg: Config) -> str:
     """Suggested reviewer: owner-like tag, else the resource group."""
     if res is None:
@@ -78,6 +89,8 @@ def owner_of(res: Resource | None, cfg: Config) -> str:
             return res.tags[key]
     if res.provider == "gcp":
         return f"project:{res.account}"
+    if res.provider == "aws":
+        return f"account:{res.account}"
     return f"rg:{res.group}" if res.group else ""
 
 

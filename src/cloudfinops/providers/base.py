@@ -35,12 +35,14 @@ class Provider(Protocol):
         """Build a Dataset from raw files in run_dir."""
 
 
-def get_provider(name: str) -> Provider:
+def get_provider(name: str, cfg: Config | None = None) -> Provider:
+    if name == "aws":
+        from .aws_cli import AwsProvider
+        return AwsProvider(cfg)
     if name == "azure":
         from .azure import AzureProvider
         return AzureProvider()
     if name == "gcp":
         from .gcp import GcpProvider
         return GcpProvider()
-    raise ValueError(f"Provider '{name}' is not supported by `assess` yet (supported: azure, gcp). "
-                     "For AWS use `cloudfinops collect aws` + `analyze`.")
+    raise ValueError(f"Provider '{name}' is not supported by `assess` yet (supported: aws, azure, gcp).")

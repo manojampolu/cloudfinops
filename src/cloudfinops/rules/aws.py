@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import timedelta
 
 from .. import pricing
 from ..analysis import window
 from ..models import Recommendation, Resource
-from .base import Context, account_rule, make, resource_rule
+from .base import Context, account_rule, is_non_prod, make, owner_of, resource_rule
 
 
 def _cost(res: Resource) -> float:
@@ -85,7 +86,7 @@ def lb_idle(res: Resource, ctx: Context):
 @resource_rule("ec2-idle", "Running instances with near-zero CPU", "ec2_instance")
 def ec2_idle(res: Resource, ctx: Context):
     cpu_max = res.metrics.get("cpu_max_14d")
-    if not _running(res) or cpu_max is None or cpu_max >= ctx.cfg.idle_cpu_max_pct:
+    if not _running(res) or cpu_max is None or cpu_max >= ctx.cfg.idle_cpu_max_pct or res.attributes.get("asg"):
         return None
     return make("ec2-idle", res, title=f"Idle EC2 instance ({res.attributes.get('instance_type')})",
                 category="waste", est_monthly_savings=_cost(res), effort="low", risk="medium",
@@ -108,7 +109,7 @@ def rds_idle(res: Resource, ctx: Context):
 @resource_rule("ec2-rightsize", "Over-provisioned instances", "ec2_instance")
 def ec2_rightsize(res: Resource, ctx: Context):
     cpu_avg, cpu_max = res.metrics.get("cpu_avg_14d"), res.metrics.get("cpu_max_14d")
-    if not _running(res) or cpu_avg is None or cpu_max is None:
+    if not _running(res) or cpu_avg is None or cpu_max is None or res.attributes.get("asg"):
         return None
     if cpu_max < ctx.cfg.idle_cpu_max_pct:  # handled by ec2-idle
         return None
@@ -188,16 +189,17 @@ def ec2_graviton(res: Resource, ctx: Context):
 
 @resource_rule("nonprod-schedule", "Non-production resources running 24/7", "ec2_instance", "rds_instance")
 def nonprod_schedule(res: Resource, ctx: Context):
-    env = res.tags.get("environment", "").lower()
-    if env not in ctx.cfg.non_prod_env_values or not _running(res):
+    reason = is_non_prod(res, ctx)
+    if not reason or not _running(res) or res.attributes.get("asg"):
         return None
+    env = res.tags.get("environment") or res.tags.get("env") or "non-prod"
     if res.metrics.get("cpu_max_14d", 100) < ctx.cfg.idle_cpu_max_pct:  # idle rule is better
         return None
     off_share = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
     return make("nonprod-schedule", res, title=f"Schedule '{env}' {res.type.replace('_', ' ')} off-hours",
                 category="scheduling", est_monthly_savings=_cost(res) * off_share, effort="low",
-                detail=f"Running only {ctx.cfg.non_prod_on_hours_per_week:.0f}h/week instead of 168h "
-                       f"cuts compute by {off_share:.0%}.",
+                detail=f"Classified non-production: {reason}. Running only {ctx.cfg.non_prod_on_hours_per_week:.0f}h/week "
+                       f"instead of 168h cuts compute by {off_share:.0%}.",
                 action="Use AWS Instance Scheduler / EventBridge Scheduler to stop nights and weekends.")
 
 
@@ -206,7 +208,7 @@ def nonprod_schedule(res: Resource, ctx: Context):
 @resource_rule("s3-lifecycle", "Large S3 buckets without lifecycle / tiering", "s3_bucket")
 def s3_lifecycle(res: Resource, ctx: Context):
     gb = float(res.attributes.get("standard_gb", 0))
-    if gb < ctx.cfg.s3_large_bucket_gb or res.attributes.get("has_lifecycle_policy"):
+    if gb < ctx.cfg.s3_large_bucket_gb or res.attributes.get("has_lifecycle_policy") is not False:
         return None
     savings = gb * 0.5 * (pricing.S3_STANDARD_GB_MONTH - pricing.S3_INFREQUENT_GB_MONTH)
     return make("s3-lifecycle", res, title=f"S3 bucket with {gb / 1024:.1f} TB in Standard, no lifecycle policy",
@@ -221,6 +223,8 @@ def s3_lifecycle(res: Resource, ctx: Context):
 @resource_rule("untagged", "Resources missing required cost-allocation tags",
                "ec2_instance", "ebs_volume", "rds_instance", "load_balancer", "s3_bucket")
 def untagged(res: Resource, ctx: Context):
+    if "account_alias" in ctx.extras:  # assess --provider aws: rolled up per account by aws-untagged
+        return None
     missing = [t for t in ctx.cfg.required_tags if not res.tags.get(t.lower())]
     if not missing:
         return None
@@ -238,15 +242,24 @@ COMPUTE_SERVICES = ("Amazon Elastic Compute Cloud - Compute", "Amazon EC2", "AWS
 
 @account_rule("savings-plan", "Steady on-demand compute spend that could be covered by a Savings Plan")
 def savings_plan(ctx: Context) -> list[Recommendation]:
-    recent = window(ctx.records, ctx.cfg.lookback_days)
-    compute = [r for r in recent if r.service in COMPUTE_SERVICES]
-    if not compute:
-        return []
-    has_pricing = any(r.pricing_category for r in compute)
-    on_demand = [r for r in compute if r.pricing_category in ("On-Demand", "")]
     daily = defaultdict(float)
-    for r in on_demand:
-        daily[r.day] += r.cost
+    rows = ctx.extras.get("pricing_model_daily")
+    if rows:  # Cost Explorer by purchase type (assess --provider aws)
+        end = max(r["day"] for r in rows)
+        start = end - timedelta(days=ctx.cfg.lookback_days - 1)
+        for r in rows:
+            if r["service"] in COMPUTE_SERVICES and r["pricing_model"] == "On-Demand" and start <= r["day"] <= end:
+                daily[r["day"]] += r["cost"]
+        has_pricing = True
+    else:
+        recent = window(ctx.records, ctx.cfg.lookback_days)
+        compute = [r for r in recent if r.service in COMPUTE_SERVICES]
+        if not compute:
+            return []
+        has_pricing = any(r.pricing_category for r in compute)
+        for r in compute:
+            if r.pricing_category in ("On-Demand", ""):
+                daily[r.day] += r.cost
     if len(daily) < 7:
         return []
     values = sorted(daily.values())
@@ -274,9 +287,15 @@ def data_transfer(ctx: Context) -> list[Recommendation]:
     total = sum(r.cost for r in recent)
     if not total:
         return []
-    dt = sum(r.cost for r in recent
-             if "data transfer" in r.service.lower() or "datatransfer" in r.usage_type.lower().replace("-", "")
-             or "natgateway" in r.usage_type.lower().replace("-", ""))
+    usage = ctx.extras.get("usage_types")
+    if usage:  # Cost Explorer usage types for the last 30 days (assess --provider aws)
+        dt = sum(v["cost"] for k, v in usage.items()
+                 if any(x in k.lower().replace("-", "") for x in ("datatransfer", "natgatewaybytes", "awsout")))
+        dt *= ctx.cfg.lookback_days / 30
+    else:
+        dt = sum(r.cost for r in recent
+                 if "data transfer" in r.service.lower() or "datatransfer" in r.usage_type.lower().replace("-", "")
+                 or "natgateway" in r.usage_type.lower().replace("-", ""))
     share = dt / total
     if share < ctx.cfg.data_transfer_share_warn:
         return []
@@ -289,3 +308,283 @@ def data_transfer(ctx: Context) -> list[Recommendation]:
                "internet egress without a CDN.",
         action="Add S3/DynamoDB gateway VPC endpoints, keep chatty services in one AZ, front egress with CloudFront.",
     )]
+
+
+# =========================================================================== assess --provider aws: more services
+
+# Confidence / evidence gaps for the original rules (applied in run_rules; they predate the evidence model)
+LEGACY_PROFILE = {
+    "ebs-unattached": ("high", []), "eip-unassociated": ("high", []), "ebs-gp2-to-gp3": ("high", []),
+    "untagged": ("high", []), "ebs-snapshot-old": ("medium", []), "ec2-stopped-long": ("medium", []),
+    "lb-idle": ("medium", []), "ec2-idle": ("medium", ["Network activity not evaluated"]),
+    "rds-idle": ("medium", []), "savings-plan": ("medium", ["12-month demand forecast"]),
+    "ec2-rightsize": ("low", ["Memory utilization (needs the CloudWatch agent)"]),
+    "rds-rightsize": ("low", ["Freeable memory and IOPS headroom"]),
+    "ec2-graviton": ("low", ["arm64 compatibility of AMI, agents and binaries"]),
+    "nonprod-schedule": ("medium", ["Agreed operating hours"]),
+    "s3-lifecycle": ("low", ["Access pattern of the data"]), "data-transfer": ("low", ["Traffic destinations"]),
+}
+SECURITY_SERVICES = ("Amazon GuardDuty", "Amazon Inspector", "AWS Security Hub", "Amazon Macie", "Amazon Detective")
+
+
+def _money(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def _cost_ev(res: Resource) -> str:
+    src = {"billing": "billing export", "estimate": "list-price estimate"}.get(res.cost_source, "unknown")
+    return f"Current cost {_money(_cost(res))}/mo ({src})"
+
+
+def _members(res: Resource, ctx: Context) -> list[Resource]:
+    return [ctx.by_id[i] for i in res.attributes.get("instance_ids", []) if i in ctx.by_id]
+
+
+@resource_rule("aws-nat-idle", "NAT gateways with no traffic", "aws.nat_gateway")
+def nat_idle(res: Resource, ctx: Context):
+    if res.attributes.get("state") != "available" or res.metrics.get("bytes_window") != 0:
+        return None
+    return make("aws-nat-idle", res, title="NAT gateway carried no traffic in 14 days", category="waste",
+                est_monthly_savings=_cost(res), confidence="medium",
+                evidence=["BytesOutToDestination = 0 over the metrics window", _cost_ev(res)],
+                action="Delete the NAT gateway (and release its Elastic IP) if nothing in the VPC needs outbound access.")
+
+
+@resource_rule("aws-nat-heavy", "NAT gateways processing a lot of data", "aws.nat_gateway")
+def nat_heavy(res: Resource, ctx: Context):
+    gb = res.metrics.get("processed_gb_30d", 0)
+    if gb < ctx.cfg.nat_heavy_gb_30d:
+        return None
+    processing = gb * pricing.NAT_GATEWAY_GB
+    eps = res.attributes.get("vpc_endpoints") or []
+    has_s3 = any(e.startswith("s3:Gateway") for e in eps)
+    has_ddb = any(e.startswith("dynamodb:Gateway") for e in eps)
+    return make("aws-nat-heavy", res, title=f"NAT gateway processes ~{gb:,.0f} GB/month ({_money(processing)} processing)",
+                category="modernization", est_monthly_savings=0.0, savings_low=0.0, savings_high=processing * 0.5,
+                confidence="low",
+                evidence=[f"~{gb:,.0f} GB/month through the NAT (${pricing.NAT_GATEWAY_GB}/GB)",
+                          f"S3 gateway endpoint in VPC: {'yes' if has_s3 else 'no'}; DynamoDB: {'yes' if has_ddb else 'no'}"],
+                assumptions=["Upper bound: half the traffic goes to AWS services reachable through free gateway endpoints"],
+                missing_evidence=["Traffic destinations (VPC Flow Logs)"],
+                action="Add S3/DynamoDB gateway endpoints (free) and interface endpoints for chatty AWS APIs; "
+                       "keep NAT per AZ to avoid cross-AZ charges.")
+
+
+@resource_rule("aws-vpn-down", "Site-to-Site VPN connections with all tunnels down", "aws.vpn_connection")
+def vpn_down(res: Resource, ctx: Context):
+    tunnels = res.attributes.get("tunnels") or []
+    if res.attributes.get("state") != "available" or not tunnels or any(t == "UP" for t in tunnels):
+        return None
+    return make("aws-vpn-down", res, title="VPN connection with all tunnels down", category="waste",
+                est_monthly_savings=_cost(res), confidence="medium",
+                evidence=[f"Tunnel status: {', '.join(tunnels)}", _cost_ev(res)],
+                action="Delete the VPN connection if the remote site is gone (billed hourly while it exists).")
+
+
+@resource_rule("aws-network-firewall-nonprod", "Network Firewall in non-production", "aws.network_firewall")
+def firewall_nonprod(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    if not reason:
+        return None
+    return make("aws-network-firewall-nonprod", res,
+                title=f"Non-prod Network Firewall with {res.attributes.get('endpoints', 1)} endpoint(s)", category="waste",
+                est_monthly_savings=_cost(res), confidence="low",
+                evidence=[f"Classified non-production: {reason}", _cost_ev(res)],
+                missing_evidence=["Security requirement for traffic inspection in this environment"],
+                action="Use a shared inspection VPC, or security groups/NACLs only, for non-production.")
+
+
+@resource_rule("aws-asg-idle", "Auto Scaling groups with near-zero CPU", "aws.asg")
+def asg_idle(res: Resource, ctx: Context):
+    m = res.metrics
+    cost = sum(_cost(i) for i in _members(res, ctx))
+    if "cpu_max" not in m or m["cpu_max"] >= ctx.cfg.idle_cpu_max_pct or cost < 1:
+        return None
+    return make("aws-asg-idle", res, title=f"Idle Auto Scaling group ({res.attributes.get('desired')} x {res.sku})",
+                category="waste", est_monthly_savings=cost, current_monthly_cost=cost, confidence="medium", risk="medium",
+                evidence=[f"Group CPU max {m['cpu_max']:.1f}% over 14 days", f"{len(_members(res, ctx))} instance(s)"],
+                related=res.attributes.get("instance_ids", []),
+                action="Set desired/min capacity to 0 or delete the group after confirming with the owner.")
+
+
+@resource_rule("aws-asg-rightsize", "Over-provisioned Auto Scaling groups", "aws.asg")
+def asg_rightsize(res: Resource, ctx: Context):
+    m, cfg = res.metrics, ctx.cfg
+    cost = sum(_cost(i) for i in _members(res, ctx))
+    if "cpu_p95" not in m or m.get("cpu_max", 0) < cfg.idle_cpu_max_pct or cost < 1:
+        return None
+    if m["cpu_p95"] >= cfg.rightsize_cpu_p95_pct or m["cpu_avg"] >= cfg.rightsize_cpu_avg_pct:
+        return None
+    target = pricing.downsize(res.sku)
+    action = (f"Change the launch template to {target}" if target else "Lower min/desired capacity") + \
+        " or add target-tracking scaling on CPU."
+    return make("aws-asg-rightsize", res, title=f"Auto Scaling group runs at {m['cpu_p95']:.0f}% CPU p95 ({res.attributes.get('desired')} x {res.sku})",
+                category="rightsizing", est_monthly_savings=cost * 0.5, current_monthly_cost=cost, confidence="low",
+                effort="medium", evidence=[f"Group CPU avg {m['cpu_avg']:.0f}%, p95 {m['cpu_p95']:.0f}%", f"Desired {res.attributes.get('desired')}"],
+                assumptions=["Half the capacity (smaller type or fewer instances) carries the load"],
+                missing_evidence=["Memory utilization", "Scaling policies and peak events"],
+                related=res.attributes.get("instance_ids", []), action=action)
+
+
+@resource_rule("aws-asg-nonprod-schedule", "Non-production Auto Scaling groups running 24/7", "aws.asg")
+def asg_schedule(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    cost = sum(_cost(i) for i in _members(res, ctx))
+    if not reason or not res.attributes.get("desired") or cost < 1:
+        return None
+    off = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
+    return make("aws-asg-nonprod-schedule", res, title=f"Schedule non-prod Auto Scaling group to 0 off-hours",
+                category="scheduling", est_monthly_savings=cost * off, current_monthly_cost=cost, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", f"Desired capacity {res.attributes.get('desired')}"],
+                missing_evidence=["Agreed operating hours"], related=res.attributes.get("instance_ids", []),
+                action="Add scheduled actions (desired 0 at night/weekends, restore in the morning).")
+
+
+@resource_rule("aws-ecs-rightsize", "Fargate services with low CPU", "aws.ecs_service")
+def ecs_rightsize(res: Resource, ctx: Context):
+    m, a = res.metrics, res.attributes
+    if a.get("launch_type") != "FARGATE" or "cpu_p95" not in m or _cost(res) < 5:
+        return None
+    if m["cpu_p95"] >= 30 or m["cpu_avg"] >= 15:
+        return None
+    return make("aws-ecs-rightsize", res, title=f"Fargate service uses {m['cpu_p95']:.0f}% CPU p95 ({res.sku} x {a.get('running')})",
+                category="rightsizing", est_monthly_savings=_cost(res) * 0.5, confidence="low", effort="medium",
+                evidence=[f"CPU avg {m['cpu_avg']:.0f}%, p95 {m['cpu_p95']:.0f}% of task allocation", _cost_ev(res)],
+                assumptions=["Half the task size (or task count) is enough"],
+                missing_evidence=["Memory utilization (MemoryUtilization not collected)"],
+                action="Reduce task CPU/memory in the task definition, or lower the desired count with service auto scaling.")
+
+
+@resource_rule("aws-ecs-nonprod-schedule", "Non-production ECS services running 24/7", "aws.ecs_service")
+def ecs_schedule(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx) or (is_non_prod(Resource(id="", type="", name=res.attributes.get("cluster", "")), ctx))
+    if not reason or not res.attributes.get("desired") or _cost(res) < 1:
+        return None
+    off = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
+    return make("aws-ecs-nonprod-schedule", res, title="Scale non-prod ECS service to 0 off-hours", category="scheduling",
+                est_monthly_savings=_cost(res) * off, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", f"Desired tasks {res.attributes.get('desired')}", _cost_ev(res)],
+                missing_evidence=["Agreed operating hours"],
+                action="Use Application Auto Scaling scheduled actions to set desired count 0 outside working hours.")
+
+
+@resource_rule("aws-apprunner-unused", "App Runner services with no requests", "aws.apprunner_service")
+def apprunner_unused(res: Resource, ctx: Context):
+    if res.attributes.get("status") != "RUNNING" or res.metrics.get("requests_30d") != 0:
+        return None
+    return make("aws-apprunner-unused", res, title="App Runner service received no requests in 14 days", category="waste",
+                est_monthly_savings=_cost(res), confidence="medium",
+                evidence=["Requests = 0 over the metrics window", _cost_ev(res)],
+                action="Pause the service (no charge while paused) or delete it.")
+
+
+@resource_rule("aws-rds-nonprod-multiaz", "Non-production RDS with Multi-AZ", "rds_instance")
+def rds_nonprod_multiaz(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    if not reason or not res.attributes.get("multi_az") or _cost(res) < 1:
+        return None
+    return make("aws-rds-nonprod-multiaz", res, title=f"Non-prod RDS {res.sku} runs Multi-AZ", category="waste",
+                est_monthly_savings=_cost(res) * 0.5, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", "MultiAZ = true", _cost_ev(res)],
+                assumptions=["The standby doubles instance cost"],
+                action="Convert to Single-AZ (modify-db-instance --no-multi-az) for non-production.")
+
+
+def _major(engine: str, version: str) -> str:
+    v = version or ""
+    if engine == "aurora-mysql":
+        return "5.7" if v.startswith("5.7") or ".2." in v else v.split(".")[0]
+    if engine in ("mysql", "mariadb"):
+        return ".".join(v.split(".")[:2])
+    return v.split(".")[0]
+
+
+@resource_rule("aws-rds-extended-support", "RDS engines in paid Extended Support", "rds_instance")
+def rds_extended_support(res: Resource, ctx: Context):
+    a = res.attributes
+    engine, major = a.get("engine", ""), _major(a.get("engine", ""), a.get("engine_version", ""))
+    if major not in (ctx.cfg.rds_extended_support.get(engine) or []):
+        return None
+    vcpu = pricing.instance_vcpu(res.sku) or 2
+    est = vcpu * pricing.RDS_EXTENDED_SUPPORT_VCPU_HOURLY * ctx.cfg.hours_per_month * (2 if a.get("multi_az") else 1)
+    seen = [k for k in (ctx.extras.get("usage_types") or {}) if "extendedsupport" in k.lower().replace("-", "")]
+    return make("aws-rds-extended-support", res, title=f"{engine} {a.get('engine_version')} is in RDS Extended Support",
+                scenario_group=f"{res.id}|extended-support",  # additive to rightsizing/scheduling of the same DB
+                category="modernization", est_monthly_savings=est, confidence="medium" if seen else "low", effort="high",
+                evidence=[f"Engine {engine} {a.get('engine_version')} ({vcpu} vCPU{', Multi-AZ' if a.get('multi_az') else ''})"]
+                + ([f"Extended Support charges on the bill: {', '.join(seen[:3])}"] if seen else []),
+                assumptions=[f"~${pricing.RDS_EXTENDED_SUPPORT_VCPU_HOURLY}/vCPU-hour (years 1-2 rate)"],
+                missing_evidence=[] if seen else ["Extended Support line items not seen in Cost Explorer usage types"],
+                action="Plan a major-version upgrade (blue/green deployment) to a version in standard support.",
+                validation_steps=["Test the application against the new engine version"])
+
+
+@account_rule("aws-compute-optimizer", "AWS Compute Optimizer rightsizing (provider-native)")
+def compute_optimizer(ctx: Context) -> list[Recommendation]:
+    recs = []
+    for r in ctx.extras.get("compute_optimizer") or []:
+        if r["finding"].upper() not in ("OVER_PROVISIONED", "OVERPROVISIONED") or not r["target_type"]:
+            continue
+        res = ctx.by_id.get(r["instance_id"])
+        saving = r["monthly_savings"]
+        if not saving and res:
+            cur, new = pricing.ec2_monthly_any(r["current_type"]), pricing.ec2_monthly_any(r["target_type"])
+            saving = max(0.0, (cur or 0) - (new or 0)) * res.metrics.get("uptime_share", 1.0)
+        recs.append(Recommendation(
+            rule_id="aws-compute-optimizer", resource_id=r["instance_id"], scenario_group=r["instance_id"],
+            category="rightsizing", title=f"Compute Optimizer: {r['current_type']} -> {r['target_type']}",
+            est_monthly_savings=saving, current_monthly_cost=res.monthly_cost if res else None, confidence="medium",
+            resource_type="ec2_instance", region=res.region if res else "", account=res.account if res else "",
+            owner=owner_of(res, ctx.cfg), effort="medium",
+            evidence=[f"AWS Compute Optimizer finding: {r['finding']}"] + ([f"Reasons: {', '.join(r['reasons'])}"] if r["reasons"] else []),
+            assumptions=["Savings as reported by Compute Optimizer" if r["monthly_savings"] else "Savings from list-price difference"],
+            action=f"Change the instance type to {r['target_type']} (stop/start required).",
+            validation_steps=["Cross-check with the cloudfinops rightsizing finding (counted once)"]))
+    return recs
+
+
+@account_rule("aws-security-nonprod", "Security service spend in non-production accounts")
+def security_nonprod(ctx: Context) -> list[Recommendation]:
+    from .azure import _is_non_prod_name
+    alias = ctx.extras.get("account_alias", "")
+    token = _is_non_prod_name(alias, ctx)
+    recent = window(ctx.records, ctx.cfg.lookback_days)
+    spend = defaultdict(float)
+    for r in recent:
+        if r.service in SECURITY_SERVICES:
+            spend[r.service] += r.cost * 30 / ctx.cfg.lookback_days
+    total = sum(spend.values())
+    if not token or total < 10:
+        return []
+    return [Recommendation(
+        rule_id="aws-security-nonprod", category="licensing", scenario_group="__security_nonprod",
+        title=f"{_money(total)}/mo on security services in non-prod account '{alias}'",
+        est_monthly_savings=0.0, savings_low=0.0, savings_high=total * 0.5, current_monthly_cost=total, confidence="low",
+        evidence=[f"Account alias classified non-production ('{token}')",
+                  *[f"{k}: {_money(v)}/mo" for k, v in sorted(spend.items(), key=lambda kv: -kv[1])]],
+        assumptions=["Upper bound: half of this spend is optional in non-production"],
+        missing_evidence=["Security team's required controls for non-production"],
+        action="Review which detectors/plans are needed in non-prod (e.g. Inspector, Macie, GuardDuty protection plans).")]
+
+
+@account_rule("aws-untagged", "Resources missing required tags (rolled up per account)")
+def untagged_rollup(ctx: Context) -> list[Recommendation]:
+    if "account_alias" not in ctx.extras:
+        return []
+    taggable = ("ec2_instance", "ebs_volume", "rds_instance", "load_balancer", "s3_bucket", "aws.nat_gateway",
+                "aws.ecs_service", "aws.apprunner_service", "aws.asg")
+    items = [(r, [t for t in ctx.cfg.required_tags if not r.tags.get(t.lower())]) for r in ctx.resources
+             if r.type in taggable]
+    items = [(r, m) for r, m in items if m]
+    if not items:
+        return []
+    cost = sum(_cost(r) for r, _ in items)
+    top = sorted(items, key=lambda x: -_cost(x[0]))[:8]
+    alias = ctx.extras.get("account_alias", "")
+    return [Recommendation(
+        rule_id="aws-untagged", scenario_group="__untagged", category="governance", resource_name=alias,
+        title=f"{len(items)} resources ({_money(cost)}/mo) missing required tags in {alias}",
+        est_monthly_savings=0.0, current_monthly_cost=cost, confidence="high",
+        evidence=[f"{r.display_name} ({r.service}, {_money(_cost(r))}/mo): missing {', '.join(m)}" for r, m in top],
+        action="Add owner/environment/cost-center tags, activate them as cost allocation tags, and enforce with "
+               "AWS Organizations tag policies.")]

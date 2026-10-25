@@ -44,10 +44,21 @@ The only local change is installing the `resource-graph` CLI extension if it is 
 - **Windows**: `az` is a batch file there, so cost pages (whose URLs contain `&$skiptoken=`) are fetched over HTTPS.
   Other arguments containing cmd.exe special characters are quoted.
 
-## AWS (via `cloudfinops collect aws`)
+## AWS (`cloudfinops assess --provider aws`)
 
-`ReadOnlyAccess` + `AWSBillingReadOnlyAccess` managed policies (or the minimal action list in
-`src/cloudfinops/providers/aws.py`). Cost Explorer charges $0.01 per API request.
+Attach the AWS managed policies **ReadOnlyAccess** and **AWSBillingReadOnlyAccess** (or the equivalent `Describe*`,
+`List*`, `Get*` read actions plus `ce:GetCostAndUsage`). Compute Optimizer findings are used if the account is opted in.
+
+| Purpose | Command |
+|---|---|
+| Identity | `aws sts get-caller-identity`, `aws iam list-account-aliases`, `aws sso login` (only if the SSO session expired) |
+| Costs | `aws ce get-cost-and-usage` (3 queries; $0.01 each) |
+| Inventory (per region) | `aws ec2 describe-instances/-volumes/-addresses/-snapshots/-nat-gateways/-vpn-connections/-vpc-endpoints`, `aws rds describe-db-instances`, `aws elbv2 describe-load-balancers`, `aws autoscaling describe-auto-scaling-groups`, `aws ecs list-*/describe-*`, `aws apprunner list-services/describe-service`, `aws network-firewall list-firewalls/describe-firewall` |
+| Storage | `aws s3api list-buckets`, `get-bucket-location`, `get-bucket-lifecycle-configuration`, `get-bucket-tagging` |
+| Utilization | `aws cloudwatch get-metric-data` (batched; 14 days) |
+| Native recommendations | `aws compute-optimizer get-ec2-instance-recommendations` |
+
+The classic `cloudfinops collect aws` flow (boto3) needs the same policies.
 
 ## GCP (`cloudfinops assess --provider gcp`)
 

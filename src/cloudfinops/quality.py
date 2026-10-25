@@ -12,7 +12,7 @@ from .models import Dataset
 from .harness.errors import is_permission_error, short_error
 
 METRIC_TYPES = {"azure.vm": "cpu_avg", "azure.app_service_plan": "cpu_avg", "ec2_instance": "cpu_avg_14d",
-                "gcp.vm": "cpu_avg", "azure.container_app": "cpu_avg"}
+                "gcp.vm": "cpu_avg", "azure.container_app": "cpu_avg", "gcp.sql": "cpu_avg"}
 
 
 @dataclass
@@ -70,7 +70,13 @@ def check(ds: Dataset, summary: CostSummary, cfg: Config) -> list[QualityIssue]:
                                     "Totals mix currencies; split the assessment per currency."))
 
     # --- inventory <-> billing reconciliation
-    if recs and ds.resources:
+    resource_level = any(r.resource_id for r in recs)
+    if recs and ds.resources and not resource_level:
+        out.append(QualityIssue("info", "reconciliation",
+                                "Billing is service-level (no resource IDs), so per-resource costs are list-price estimates.",
+                                "Provide a resource-level export (AWS CUR via --billing-csv, GCP detailed billing export) "
+                                "to price findings from the actual bill."))
+    if recs and ds.resources and resource_level:
         recent = window(recs, cfg.lookback_days)
         total = sum(r.cost for r in recent) or 1.0
         ids = {r.id for r in ds.resources}
@@ -109,7 +115,16 @@ def check(ds: Dataset, summary: CostSummary, cfg: Config) -> list[QualityIssue]:
                                     "Rightsizing without memory data is low confidence (needs validation)."))
 
     # --- tagging
-    if summary.window_total:
+    taggable = [r for r in ds.resources if r.type not in ds.extras.get("free_types", set()) and (r.monthly_cost or 0) > 0]
+    if recs and not resource_level and taggable:  # spend has no tags; measure on resources instead
+        total = sum(r.monthly_cost for r in taggable)
+        tagged = sum(r.monthly_cost for r in taggable if all(r.tags.get(t.lower()) for t in cfg.required_tags))
+        share = tagged / total if total else 0.0
+        level = "ok" if share >= 0.9 else "warn"
+        out.append(QualityIssue(level, "ownership", f"{share:.0%} of estimated resource cost carries all required tags "
+                                f"({', '.join(cfg.required_tags)}).",
+                                "" if level == "ok" else "Owners are suggested from accounts/resource groups where tags are missing."))
+    elif summary.window_total:
         level = "ok" if summary.fully_tagged_share >= 0.9 else "warn"
         out.append(QualityIssue(level, "ownership", f"{summary.fully_tagged_share:.0%} of spend carries all required tags "
                                 f"({', '.join(cfg.required_tags)}).",

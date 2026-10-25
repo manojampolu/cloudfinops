@@ -126,6 +126,62 @@ def estimate_monthly(res, hours: float = HOURS) -> float | None:
             min_inst = float(a.get("min_instances") or 0)
             return run_idle_monthly(a.get("cpu", 1.0), a.get("memory_gib", 0.5), min_inst) if min_inst else None
         case "gcp.sql":
-            hourly = SQL_TIER_HOURLY.get(res.sku)
-            return hourly * hours * (2 if a.get("availability") == "REGIONAL" else 1) if hourly and a.get("state") == "running" else None
+            if a.get("state") != "running":
+                return 0.0
+            return sql_monthly(res.sku, a.get("availability") == "REGIONAL", a.get("edition", ""), hours)
+        case "gcp.forwarding_rule":
+            return FORWARDING_RULE_HOURLY * hours
+        case "gcp.vpn_tunnel":
+            return VPN_TUNNEL_HOURLY * hours
+        case "gcp.cloud_nat":
+            return float(res.metrics.get("processed_gb_30d", 0)) * CLOUD_NAT_GB or None
     return None
+
+
+# --------------------------------------------------------------------------- Cloud SQL, networking
+
+SQL_VCPU_HOUR = 0.0413  # Enterprise edition, us-central1
+SQL_GB_HOUR = 0.007
+SQL_ENTERPRISE_PLUS_FACTOR = 1.3
+FORWARDING_RULE_HOURLY = 0.025
+VPN_TUNNEL_HOURLY = 0.05
+CLOUD_NAT_GB = 0.045
+
+
+def sql_shape(tier: str) -> tuple[float, float] | None:
+    """(vCPU, memory GB) for a Cloud SQL tier: db-custom-2-7680, db-n1-standard-4, db-perf-optimized-N-8 ..."""
+    t = (tier or "").lower()
+    m = re.match(r"db-(?:custom|perf-optimized-n)-(\d+)-(\d+)$", t)
+    if m:
+        return float(m.group(1)), float(m.group(2)) / 1024
+    m = re.match(r"db-n1-(standard|highmem)-(\d+)$", t)
+    if m:
+        cpu = float(m.group(2))
+        return cpu, cpu * (3.75 if m.group(1) == "standard" else 6.5)
+    return {"db-f1-micro": (0.2, 0.6), "db-g1-small": (0.5, 1.7)}.get(t)
+
+
+def sql_downsize(tier: str) -> str | None:
+    t = (tier or "").lower()
+    m = re.match(r"db-custom-(\d+)-(\d+)$", t)
+    if m and int(m.group(1)) >= 2:
+        cpu = int(m.group(1)) // 2
+        mem = max(cpu * 3840, int(m.group(2)) // 2 // 256 * 256)
+        return f"db-custom-{cpu}-{mem}"
+    m = re.match(r"db-n1-(standard|highmem)-(\d+)$", t)
+    if m and int(m.group(2)) >= 2:
+        return f"db-n1-{m.group(1)}-{int(m.group(2)) // 2}"
+    return None
+
+
+def sql_monthly(tier: str, regional: bool = False, edition: str = "", hours: float = HOURS) -> float | None:
+    if tier in SQL_TIER_HOURLY:
+        hourly = SQL_TIER_HOURLY[tier]
+    else:
+        shape = sql_shape(tier)
+        if not shape:
+            return None
+        hourly = shape[0] * SQL_VCPU_HOUR + shape[1] * SQL_GB_HOUR
+    if (edition or "").upper() == "ENTERPRISE_PLUS":
+        hourly *= SQL_ENTERPRISE_PLUS_FACTOR
+    return hourly * hours * (2 if regional else 1)

@@ -21,7 +21,7 @@ cloudfinops = "cloudfinops.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cloudfinops = ["samples/*.csv", "samples/*.json", "samples/azure/**/*.json"]
+cloudfinops = ["samples/*.csv", "samples/*.json", "samples/azure/**/*.json", "samples/aws/**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

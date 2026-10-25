@@ -149,6 +149,8 @@ def build(ds: Dataset, recs: list[Recommendation], cfg: Config) -> tuple[Node, l
         by_account[r.account].append(r)
 
     recent = window(ds.records, cfg.lookback_days) if ds.records else []
+    if not any(r.resource_id for r in recent):
+        recent = []  # service-level billing (e.g. Cost Explorer): nothing to reconcile per resource; avoid double counting
     span = len({r.day for r in recent}) or 1
     unmapped = defaultdict(lambda: defaultdict(float))
     for rec in recent:

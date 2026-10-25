@@ -79,11 +79,24 @@ class Config:
     max_items_per_node: int = 25
     owner_tag_keys: list[str] = field(default_factory=lambda: ["owner", "team", "application-owner", "contact"])
 
+    # AWS-specific (assess --provider aws)
+    aws_profile: str = ""
+    aws_regions: list[str] = field(default_factory=list)  # empty = all enabled regions
+    aws_billing_csv: str = ""  # optional CUR / FOCUS export for resource-level costs
+    nat_heavy_gb_30d: float = 500.0  # NAT processing above this -> review gateway endpoints / routing
+    rds_extended_support: dict = field(default_factory=lambda: {
+        # engine -> major versions in RDS Extended Support (verify against the AWS release calendar)
+        "mysql": ["5.7", "8.0"], "postgres": ["11", "12", "13"],
+        "aurora-mysql": ["5.7", "2"], "aurora-postgresql": ["11", "12", "13"]})
+
     # GCP-specific
     gcp_billing_table: str = ""  # project.dataset.gcp_billing_export_resource_v1_XXXX (auto-discovered if empty)
     gcp_bucket_large_gb: float = 100.0
     gcp_artifact_large_gb: float = 1.0
     gcp_run_low_requests_30d: float = 1000.0
+    gcp_sql_extended_support: list[str] = field(default_factory=lambda: [
+        "MYSQL_5_6", "MYSQL_5_7", "POSTGRES_9_6", "POSTGRES_10", "POSTGRES_11", "POSTGRES_12"])
+    gcp_sql_extended_support_vcpu_hour: float = 0.10
     fx_to_usd: dict = field(default_factory=dict)  # e.g. {"INR": 0.012}; overrides built-in rates
 
     @classmethod

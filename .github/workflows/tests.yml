@@ -20,3 +20,4 @@ jobs:
       - run: pip install -e ".[aws,dev]"
       - run: pytest -q
       - run: cloudfinops demo --provider azure --out demo-azure
+      - run: cloudfinops demo --provider aws --out demo-aws

@@ -15,7 +15,7 @@ cloudfinops assess
 | Provider | Status |
 |---|---|
 | Azure | `assess`: interactive sign-in, Resource Graph, Cost Management, Monitor, Advisor, Log Analytics |
-| AWS | `collect aws` + `analyze` (boto3); moving to `assess` next |
+| AWS | `assess --provider aws`: aws CLI (SSO/profiles), Cost Explorer (+ optional CUR), EC2/EBS/RDS/ELB/NAT/VPN/ASG/ECS/App Runner/Network Firewall/S3, CloudWatch, Compute Optimizer |
 | GCP | `assess --provider gcp`: gcloud sign-in, Cloud Asset + per-service inventory, BigQuery billing export, Cloud Monitoring usage, Recommender |
 | Any | `analyze --billing` on a FOCUS / CUR / simple CSV export |
 
@@ -57,7 +57,8 @@ pip install -e '.[aws,dev]'
 
 cloudfinops demo --provider azure --out demo-azure   # full Azure assessment on bundled sample data
 open demo-azure/report.html
-cloudfinops demo                                     # AWS sample (text report)
+cloudfinops demo --provider aws --out demo-aws       # full AWS assessment on bundled sample data
+cloudfinops demo                                     # classic AWS text report (collect/analyze flow)
 ```
 
 ### Azure assessment
@@ -87,6 +88,18 @@ sheets, spend trends and anomalies, data quality and gaps, and the method.
 Every finding has evidence, assumptions, missing evidence, validation steps, connected resources, a suggested
 owner and a confidence level. Findings without key evidence are marked **needs validation** and given a
 savings range starting at zero.
+
+### AWS assessment
+
+```bash
+cloudfinops assess --provider aws                        # current credentials (runs `aws sso login` if the SSO session expired)
+cloudfinops assess --provider aws --profile prod --regions us-east-1 eu-west-1
+cloudfinops assess --provider aws --billing-csv cur-2026-10.csv   # resource-level costs from a CUR / FOCUS export
+```
+
+Cost Explorer gives service-level costs (3 requests at $0.01 each), so resource costs are list-price estimates unless
+you pass a CUR export. Services that are access-denied are skipped in every region and reported once. Run once per
+account or profile. The classic `collect aws` + `analyze` flow still works.
 
 ### GCP assessment
 
@@ -161,6 +174,17 @@ Run `cloudfinops rules` for the live list.
 
 ### AWS
 
+`assess --provider aws` adds these rules to the classic ones in the table that follows:
+
+| Area | Rules | Finds |
+|---|---|---|
+| Network | `aws-nat-idle`, `aws-nat-heavy`, `aws-vpn-down`, `aws-network-firewall-nonprod` | NAT gateways with no traffic or heavy processing (missing S3/DynamoDB gateway endpoints), VPNs with all tunnels down, Network Firewall in non-prod |
+| Compute | `aws-asg-idle`, `aws-asg-rightsize`, `aws-asg-nonprod-schedule` | Auto Scaling groups judged as a group (members are not double counted) |
+| Containers | `aws-ecs-rightsize`, `aws-ecs-nonprod-schedule`, `aws-apprunner-unused` | Fargate services with low CPU or non-prod running 24/7; App Runner services with no requests |
+| Databases | `aws-rds-nonprod-multiaz`, `aws-rds-extended-support` | Multi-AZ in non-prod; engines in paid RDS Extended Support (confirmed from Cost Explorer usage types) |
+| Native | `aws-compute-optimizer` | AWS Compute Optimizer EC2 recommendations (counted once with cloudfinops rightsizing) |
+| Governance | `aws-security-nonprod`, `aws-untagged` | Security service spend in non-prod accounts; untagged resources rolled up per account |
+
 | Category | Rule | Finds |
 |---|---|---|
 | waste | `ebs-unattached` | Volumes in `available` state |
@@ -193,6 +217,18 @@ Tune thresholds with `--config` (see [cloudfinops.example.toml](cloudfinops.exam
    so only the largest counts. Commitment recommendations are sized on the compute that remains after the
    other findings. Logging commitment tiers and retention are sized on volume that stays on the Analytics plan.
 
+### GCP
+
+| Area | Rules | Finds |
+|---|---|---|
+| Compute | `gcp-vm-idle`, `gcp-vm-rightsize`, `gcp-nonprod-schedule`, `gcp-vm-stopped`, `gcp-mig-nonprod-schedule` | Compute Engine VMs and managed instance groups |
+| Storage | `gcp-disk-unattached`, `gcp-snapshot-old`, `gcp-bucket-lifecycle`, `gcp-artifact-cleanup` | Orphaned disks, old snapshots, buckets and Artifact Registry repos without lifecycle/cleanup |
+| Serverless | `gcp-run-min-instances`, `gcp-run-unused`, `gcp-function-unused` | Cloud Run warm instances for little traffic, unused services and functions |
+| Cloud SQL | `gcp-sql-idle`, `gcp-sql-rightsize`, `gcp-sql-nonprod-ha`, `gcp-sql-nonprod-stop`, `gcp-sql-extended-support` | No connections, oversized tiers, HA in non-prod, non-prod running 24/7, versions in extended support |
+| Network | `gcp-ip-unused`, `gcp-nat-heavy`, `gcp-lb-idle`, `gcp-vpn-down` | Reserved IPs, heavy Cloud NAT processing (Private Google Access), HTTPS LBs with no requests, down VPN tunnels |
+| Logging / native | `gcp-logging`, `gcp-recommender` | Ingestion above the free tier, long retention; Google Recommender findings |
+| Governance | `gcp-idle-billed-project`, `gcp-unused-apis`, `gcp-unlabelled`, `gcp-security-nonprod` | Billing-linked projects with no activity, unused APIs, missing labels, security spend in non-prod |
+
 ## Project layout
 
 ```
@@ -201,7 +237,9 @@ src/cloudfinops/
   harness/runner.py   read-only CLI runner (allowlist, retries, commands.log, raw capture)
   harness/wizard.py   interactive sign-in and scope selection
   providers/azure.py  Azure collect (CLI) + load (raw JSON -> common model)
-  providers/aws.py    AWS collector (boto3)
+  providers/aws_cli.py AWS collect (aws CLI) + load for `assess`
+  providers/gcp.py    GCP collect (gcloud / bq / Monitoring API) + load
+  providers/aws.py    classic AWS collector (boto3) for `collect aws`
   models.py           CostRecord, Resource, Relationship, Recommendation, Dataset
   analysis.py         breakdowns, trends, anomalies, cost enrichment
   rules/              registry (base.py), aws.py, azure.py, scenario totals (__init__.py)
@@ -230,7 +268,7 @@ def nat_idle(res, ctx):
 
 ## Roadmap
 
-- AWS on the `assess` harness (aws CLI: Resource Explorer/describe, `ce`, CloudWatch, Compute Optimizer)
+- AWS Organizations: assess several member accounts in one run (assume-role)
 - More Azure modules: SQL/Cosmos DB, storage account tiering, Azure Firewall/NAT, Defender plans
 - Optional importer for Azure Optimization Engine output
 - Web review UI (FastAPI) on top of the register; AI-written summaries of evidence (never deciding)

@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections import defaultdict
 
 from ..models import Recommendation, Resource
-from ..pricing_gcp import (ARTIFACT_FREE_GB, ARTIFACT_GB_MONTH, GCS_GB_MONTH, LOGGING_FREE_GIB, LOGGING_GIB,
-                           LOGGING_RETENTION_GIB_MONTH, MACHINE_HOURLY, machine_downsize, run_idle_monthly)
+from ..pricing_gcp import (ARTIFACT_FREE_GB, ARTIFACT_GB_MONTH, CLOUD_NAT_GB, GCS_GB_MONTH, LOGGING_FREE_GIB, LOGGING_GIB,
+                           LOGGING_RETENTION_GIB_MONTH, MACHINE_HOURLY, machine_downsize, run_idle_monthly, sql_downsize,
+                           sql_shape)
 from .azure import is_non_prod
 from .base import Context, account_rule, make, owner_of, resource_rule
 
@@ -87,6 +88,8 @@ def vm_rightsize(res: Resource, ctx: Context):
 
 @resource_rule("gcp-nonprod-schedule", "Non-production VMs running 24/7", "gcp.vm")
 def vm_schedule(res: Resource, ctx: Context):
+    if res.attributes.get("mig"):
+        return None  # scheduled at managed-instance-group level
     reason = is_non_prod(res, ctx)
     m = res.metrics
     if not reason or res.attributes.get("state") != "running" or m.get("uptime_share", 0) < ctx.cfg.scheduling_min_uptime_share:
@@ -348,3 +351,168 @@ def unlabelled(ctx: Context) -> list[Recommendation]:
         evidence=[f"{r.display_name} ({r.service})" for r in items[:8]],
         action="Add owner/environment/cost-center labels so billing export can be grouped by team.")
         for p, items in by_p.items()]
+
+
+# =========================================================================== Cloud SQL
+
+SQL_COMPUTE_SHARE = 0.85  # storage/backups keep billing when compute shrinks or stops
+
+
+@resource_rule("gcp-sql-idle", "Cloud SQL instances with no connections", "gcp.sql")
+def sql_idle(res: Resource, ctx: Context):
+    if res.attributes.get("state") != "running" or res.metrics.get("connections_max") != 0 or _cost(res) < 1:
+        return None
+    return make("gcp-sql-idle", res, title=f"Cloud SQL {res.attributes.get('version')} had no connections in 14 days",
+                category="waste", est_monthly_savings=_cost(res), confidence="medium", risk="medium",
+                evidence=["Max client connections: 0 (internal admin connections excluded)", _cost_ev(res)],
+                missing_evidence=_cost_missing(res),
+                action="Export/backup and delete the instance, or stop it (activation policy NEVER) if it may be needed.")
+
+
+@resource_rule("gcp-sql-rightsize", "Over-provisioned Cloud SQL instances", "gcp.sql")
+def sql_rightsize(res: Resource, ctx: Context):
+    m, cfg = res.metrics, ctx.cfg
+    if res.attributes.get("state") != "running" or "cpu_p95" not in m or m.get("connections_max") == 0:
+        return None
+    if m["cpu_p95"] >= cfg.rightsize_cpu_p95_pct or m["cpu_avg"] >= cfg.rightsize_cpu_avg_pct:
+        return None
+    mem = m.get("mem_used_p95")
+    if mem is not None and mem >= cfg.rightsize_mem_p95_pct:
+        return None
+    target = sql_downsize(res.sku)
+    if not target:
+        return None
+    return make("gcp-sql-rightsize", res, title=f"Downsize Cloud SQL {res.sku} -> {target}", category="rightsizing",
+                est_monthly_savings=_cost(res) * SQL_COMPUTE_SHARE * 0.5, confidence="high" if mem is not None else "low",
+                effort="medium", risk="medium",
+                evidence=[f"CPU avg {m['cpu_avg']:.0f}%, p95 {m['cpu_p95']:.0f}% over 14 days",
+                          *([f"Memory p95 {mem:.0f}%"] if mem is not None else []), _cost_ev(res)],
+                assumptions=[f"Compute is ~{SQL_COMPUTE_SHARE:.0%} of the instance cost; half the shape halves it"],
+                missing_evidence=([] if mem is not None else ["Memory utilization"]) + _cost_missing(res),
+                action=f"Change the machine type to {target} (restart required; brief downtime).",
+                validation_steps=["Check connection limits and peak query load of the smaller shape"])
+
+
+@resource_rule("gcp-sql-nonprod-ha", "Non-production Cloud SQL with high availability", "gcp.sql")
+def sql_nonprod_ha(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    if not reason or res.attributes.get("availability") != "REGIONAL" or _cost(res) < 1:
+        return None
+    return make("gcp-sql-nonprod-ha", res, title="Non-prod Cloud SQL runs with regional high availability", category="waste",
+                est_monthly_savings=_cost(res) * SQL_COMPUTE_SHARE * 0.5, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", "Availability type REGIONAL", _cost_ev(res)],
+                assumptions=["The HA standby doubles compute cost"], missing_evidence=_cost_missing(res),
+                action="Switch availability type to ZONAL for non-production instances.")
+
+
+@resource_rule("gcp-sql-nonprod-stop", "Non-production Cloud SQL running 24/7", "gcp.sql")
+def sql_nonprod_stop(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    m = res.metrics
+    if not reason or res.attributes.get("state") != "running" or res.attributes.get("activation_policy") != "ALWAYS":
+        return None
+    if m.get("uptime_share", 1.0) < ctx.cfg.scheduling_min_uptime_share or m.get("connections_max") == 0 or _cost(res) < 1:
+        return None
+    off = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
+    return make("gcp-sql-nonprod-stop", res, title="Stop non-prod Cloud SQL outside working hours", category="scheduling",
+                est_monthly_savings=_cost(res) * SQL_COMPUTE_SHARE * off, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", "Activation policy ALWAYS", _cost_ev(res)],
+                assumptions=["Stopped instances bill only storage"], missing_evidence=["Agreed operating hours"],
+                action="Schedule activation policy NEVER/ALWAYS (Cloud Scheduler + Cloud Functions or gcloud sql instances patch).")
+
+
+@resource_rule("gcp-sql-extended-support", "Cloud SQL major versions in extended support", "gcp.sql")
+def sql_extended_support(res: Resource, ctx: Context):
+    version = res.attributes.get("version", "")
+    if version not in ctx.cfg.gcp_sql_extended_support or res.attributes.get("state") != "running":
+        return None
+    vcpu = (sql_shape(res.sku) or (1.0, 0))[0]
+    est = vcpu * ctx.cfg.gcp_sql_extended_support_vcpu_hour * ctx.cfg.hours_per_month * \
+        (2 if res.attributes.get("availability") == "REGIONAL" else 1)
+    return make("gcp-sql-extended-support", res, title=f"Cloud SQL {version} is in extended support", category="modernization",
+                scenario_group=f"{res.id}|extended-support", est_monthly_savings=est, confidence="low", effort="high",
+                evidence=[f"Database version {version}, {vcpu:g} vCPU"],
+                assumptions=[f"~${ctx.cfg.gcp_sql_extended_support_vcpu_hour}/vCPU-hour extended support charge (configurable)"],
+                missing_evidence=["Extended support line items on the bill (needs billing export)"],
+                action="Plan an in-place major version upgrade (test on a clone first).")
+
+
+# =========================================================================== networking & instance groups
+
+@resource_rule("gcp-nat-heavy", "Cloud NAT gateways processing a lot of data", "gcp.cloud_nat")
+def nat_heavy(res: Resource, ctx: Context):
+    gb = res.metrics.get("processed_gb_30d", 0)
+    if gb < ctx.cfg.nat_heavy_gb_30d:
+        return None
+    cost = gb * CLOUD_NAT_GB
+    return make("gcp-nat-heavy", res, title=f"Cloud NAT processes ~{gb:,.0f} GB/month ({_m(cost)} processing)",
+                category="modernization", est_monthly_savings=0.0, savings_low=0.0, savings_high=cost * 0.5,
+                confidence="low", evidence=[f"~{gb:,.0f} GB sent through NAT in 30 days (${CLOUD_NAT_GB}/GB)"],
+                assumptions=["Upper bound: half the traffic goes to Google APIs reachable via Private Google Access"],
+                missing_evidence=["Traffic destinations (VPC Flow Logs)"],
+                action="Enable Private Google Access on the subnets (Google API traffic then bypasses NAT); "
+                       "review egress to the internet.")
+
+
+@resource_rule("gcp-lb-idle", "HTTP(S) load balancers with no requests", "gcp.forwarding_rule")
+def lb_idle(res: Resource, ctx: Context):
+    if not res.attributes.get("http") or res.metrics.get("requests_30d") != 0:
+        return None
+    return make("gcp-lb-idle", res, title="HTTP(S) load balancer received no requests in 30 days", category="waste",
+                est_monthly_savings=_cost(res), confidence="medium",
+                evidence=[f"Forwarding rule {res.display_name} -> {res.attributes.get('target')}", "0 requests in 30 days",
+                          _cost_ev(res)],
+                missing_evidence=_cost_missing(res),
+                action="Delete the forwarding rule, proxy, URL map and backend service if the site is retired.")
+
+
+@resource_rule("gcp-vpn-down", "Cloud VPN tunnels that are not established", "gcp.vpn_tunnel")
+def vpn_down(res: Resource, ctx: Context):
+    if res.attributes.get("status") in ("ESTABLISHED", "PROVISIONING", "WAITING_FOR_FULL_CONFIG"):
+        return None
+    return make("gcp-vpn-down", res, title=f"VPN tunnel is {res.attributes.get('status')}", category="waste",
+                est_monthly_savings=_cost(res), confidence="medium",
+                evidence=[f"Status {res.attributes.get('status')}: {res.attributes.get('detail')}", f"Peer {res.attributes.get('peer_ip')}"],
+                action="Delete the tunnel (billed hourly) if the remote site is gone, or fix the peer configuration.")
+
+
+@resource_rule("gcp-mig-nonprod-schedule", "Non-production managed instance groups running 24/7", "gcp.mig")
+def mig_schedule(res: Resource, ctx: Context):
+    reason = is_non_prod(res, ctx)
+    members = [ctx.by_id[i] for i in res.related if i in ctx.by_id and ctx.by_id[i].type == "gcp.vm"]
+    cost = sum(_cost(v) for v in members)
+    if not reason or not res.attributes.get("target_size") or cost < 1:
+        return None
+    off = 1 - ctx.cfg.non_prod_on_hours_per_week / 168
+    return make("gcp-mig-nonprod-schedule", res, title=f"Scale non-prod instance group to 0 off-hours ({len(members)} VMs)",
+                category="scheduling", est_monthly_savings=cost * off, current_monthly_cost=cost, confidence="medium",
+                evidence=[f"Classified non-production: {reason}", f"Target size {res.attributes['target_size']}",
+                          f"Autoscaled: {'yes' if res.attributes.get('autoscaled') else 'no'}"],
+                missing_evidence=["Agreed operating hours"],
+                action="Add an autoscaler schedule (scaling schedules) with minimum 0 outside working hours.")
+
+
+@account_rule("gcp-security-nonprod", "Security service spend in non-production projects", provider="gcp")
+def security_nonprod(ctx: Context) -> list[Recommendation]:
+    from collections import defaultdict as dd
+    from .azure import _is_non_prod_name
+    spend = dd(float)
+    days = len({r.day for r in ctx.records}) or 30
+    for r in ctx.records:
+        if any(k in r.service for k in ("Security Command Center", "Cloud Armor", "Web Security Scanner")):
+            spend[r.account] += r.cost / days * 30
+    recs = []
+    for project, total in spend.items():
+        token = _is_non_prod_name(project, ctx)
+        if not token or total < 10:
+            continue
+        recs.append(Recommendation(
+            rule_id="gcp-security-nonprod", resource_id=f"//cloudresourcemanager.googleapis.com/projects/{project}/security",
+            account=project, category="licensing", resource_name=project, service="Security services",
+            title=f"{_m(total)}/mo on security services in non-prod project {project}", est_monthly_savings=0.0,
+            savings_low=0.0, savings_high=total * 0.5, current_monthly_cost=total, confidence="low",
+            evidence=[f"Project classified non-production ('{token}')"],
+            assumptions=["Upper bound: half of this spend is optional in non-production"],
+            missing_evidence=["Security team's required controls for non-production"],
+            action="Review Security Command Center tier / Cloud Armor policies needed in non-production."))
+    return recs

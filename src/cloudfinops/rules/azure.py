@@ -13,7 +13,7 @@ from datetime import timedelta
 
 from ..models import Recommendation, Resource
 from ..pricing_azure import disk_tier_price, vm_downsize
-from .base import Context, account_rule, make, owner_of, resource_rule
+from .base import Context, account_rule, is_non_prod, make, owner_of, resource_rule  # noqa: F401
 
 COMPUTE_TYPES = ("azure.vm", "azure.vmss")
 TAGGABLE = ("azure.vm", "azure.vmss", "azure.disk", "azure.app_service_plan", "azure.aks", "azure.log_workspace",
@@ -26,16 +26,6 @@ def _cost(res: Resource) -> float:
 
 def _money(v: float) -> str:
     return f"${v:,.2f}"
-
-
-def is_non_prod(res: Resource, ctx: Context) -> str | None:
-    """Return the reason a resource looks non-production, or None."""
-    env = res.tags.get("environment") or res.tags.get("env") or ""
-    if env:
-        return f"tag environment={env}" if env.lower() in ctx.cfg.non_prod_env_values else None
-    tokens = set(re.split(r"[-_.\s]+", f"{res.name} {res.group}".lower()))
-    hit = tokens & set(ctx.cfg.non_prod_name_tokens)
-    return f"name/resource group contains '{sorted(hit)[0]}'" if hit else None
 
 
 def _cost_evidence(res: Resource) -> str:
@@ -603,6 +593,7 @@ def ahb_windows(res: Resource, ctx: Context):
     uptime = res.metrics.get("uptime_share", 1.0)
     est = _cap_to_billing(size["vcpu"] * rate * ctx.cfg.hours_per_month * uptime, res)
     return make("az-ahb-windows", res, title=f"Apply Azure Hybrid Benefit to Windows VM ({res.sku})",
+                scenario_group=f"{res.id}|licence",  # licence savings add to rightsizing/scheduling of the same VM
                 category="licensing", est_monthly_savings=est, confidence="low", effort="low", risk="low",
                 evidence=["OS type Windows, licenseType not set (paying for the Windows licence)", _cost_evidence(res),
                           f"{size['vcpu']} vCPU running {uptime:.0%} of hours"],

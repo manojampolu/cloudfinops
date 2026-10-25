@@ -41,3 +41,12 @@ cost_query_pause_s = 45
 
 # Azure: look up VM prices from the public Retail Prices API during collection (false = built-in table only)
 price_lookup = true
+
+# AWS (assess --provider aws)
+# aws_profile = "prod"
+# aws_regions = ["us-east-1", "eu-west-1"]
+nat_heavy_gb_30d = 500          # NAT processing above this (GB/month) -> review endpoints / routing
+
+# GCP Cloud SQL versions in extended support and the assumed charge
+gcp_sql_extended_support = ["MYSQL_5_6", "MYSQL_5_7", "POSTGRES_9_6", "POSTGRES_10", "POSTGRES_11", "POSTGRES_12"]
+gcp_sql_extended_support_vcpu_hour = 0.10
