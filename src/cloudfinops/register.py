@@ -139,6 +139,30 @@ class Register:
             "open": sum(1 for r in rows if r["status"] in ("open", "in-review") and r["active"]),
         }
 
+    def rule_stats(self) -> list[dict]:
+        """Owner decisions per rule: the calibration signal (which rules owners accept or reject)."""
+        accepted = ("approved", "implemented", "verified")
+        stats: dict[str, dict] = {}
+        for r in self.rows(active_only=False):
+            st = stats.setdefault(r["rule_id"], {"rule_id": r["rule_id"], "findings": 0, "accepted": 0, "rejected": 0,
+                                                 "deferred": 0, "open": 0, "estimated": 0.0, "validated": 0.0})
+            st["findings"] += 1
+            st["estimated"] += r["est_monthly_savings"] or 0.0
+            st["validated"] += r["validated_savings"] or 0.0
+            if r["status"] in accepted:
+                st["accepted"] += 1
+            elif r["status"] == "rejected":
+                st["rejected"] += 1
+            elif r["status"] == "deferred":
+                st["deferred"] += 1
+            else:
+                st["open"] += 1
+        for st in stats.values():
+            decided = st["accepted"] + st["rejected"]
+            st["acceptance"] = st["accepted"] / decided if decided else None
+            st["noisy"] = st["rejected"] >= 3 and (st["acceptance"] or 0) < 0.5
+        return sorted(stats.values(), key=lambda s: (-(s["accepted"] + s["rejected"]), -s["estimated"]))
+
     # ------------------------------------------------------------------ verification
 
     def verify(self, min_days_after: int = 7, baseline_days: int = 30) -> list[dict]:

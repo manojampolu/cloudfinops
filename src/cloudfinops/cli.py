@@ -64,7 +64,8 @@ def _assess_run_dir(run_dir: Path, out_dir: Path, args, register: Path | None) -
         from .scope import filter_resource_groups
         ds = filter_resource_groups(ds, groups)
         out_dir = Path(out_dir) / ("rg-" + "-".join(ds.scope["resource_groups"])[:80])
-    result = assess(ds, cfg, out_dir, run_dir=run_dir, register_path=register, disabled=set(args.disable or []))
+    result = assess(ds, cfg, out_dir, run_dir=run_dir, register_path=register, disabled=set(args.disable or []),
+                    redact=getattr(args, "redact", None) or cfg.redact)
     t = result.totals
     nv = sum(1 for r in result.recommendations if r.needs_validation)
     spend = f"${result.summary.window_total:,.0f}" if ds.records else "unknown (no billing data)"
@@ -135,6 +136,23 @@ def cmd_register(args) -> int:
                 raise ValueError("Nothing to update (use --status/--owner/--validated/--implemented-on/--notes)")
             reg.update(args.id, **fields)
             print(f"Updated {args.id}: {fields}")
+        elif args.action == "stats":
+            stats = reg.rule_stats()
+            print(f"{'rule':<30} {'findings':>8} {'accepted':>8} {'rejected':>8} {'open':>6} {'accept%':>8} "
+                  f"{'est/mo':>10} {'valid/mo':>10}")
+            for st in stats:
+                rate = "-" if st["acceptance"] is None else f"{st['acceptance']:.0%}"
+                flag = "  <- often rejected: review threshold" if st["noisy"] else ""
+                print(f"{st['rule_id']:<30} {st['findings']:>8} {st['accepted']:>8} {st['rejected']:>8} {st['open']:>6} "
+                      f"{rate:>8} {st['estimated']:>10,.0f} {st['validated']:>10,.0f}{flag}")
+            decided = sum(s["accepted"] + s["rejected"] for s in stats)
+            accepted = sum(s["accepted"] for s in stats)
+            if decided:
+                print(f"\nOverall: {accepted}/{decided} reviewed findings accepted ({accepted / decided:.0%}); "
+                      f"validated ${sum(s['validated'] for s in stats):,.0f}/mo of "
+                      f"${sum(s['estimated'] for s in stats if s['accepted']):,.0f}/mo estimated on accepted rules")
+            else:
+                print("\nNo decisions recorded yet: use `register update <id> --status approved|rejected`.")
         elif args.action == "verify":
             for res in reg.verify():
                 print(f"{res['key']}: {res['status']}"
@@ -212,6 +230,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_analyze)
 
     p = sub.add_parser("demo", help="run analysis on bundled sample data")
+    p.add_argument("--redact", nargs="?", const="ids", choices=["ids", "all"],
+                   help="also write redacted copies for sharing: ids (default) or all (adds resource names)")
     p.add_argument("--provider", choices=["aws", "azure"],
                    help="run the full assessment pipeline on sample data (omit for the classic AWS text report)")
     p.add_argument("--out", help="output folder for --provider (default ./demo-<provider>)")
@@ -219,6 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("assess", help="read-only assessment: login, collect, analyze, report")
+    p.add_argument("--redact", nargs="?", const="ids", choices=["ids", "all"],
+                   help="also write redacted copies for sharing: ids (default) or all (adds resource names)")
     p.add_argument("--provider", choices=["aws", "azure", "gcp"],
                    help="default azure; with --from, read from the run folder")
     p.add_argument("--subscriptions", "--projects", dest="subscriptions", nargs="*",
@@ -242,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_assess)
 
     p = sub.add_parser("register", help="savings register: track decisions, validated and realized savings")
-    p.add_argument("action", choices=["list", "update", "verify", "export"])
+    p.add_argument("action", choices=["list", "update", "verify", "export", "stats"])
     p.add_argument("id", nargs="?", help="finding id (number from `list`) or key, for update")
     p.add_argument("--db", default="runs/register.db")
     p.add_argument("--status", help="filter (list) or new status (update)")

@@ -22,6 +22,19 @@ cloudfinops assess
 Core has zero dependencies (Python 3.11+). Azure needs the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli);
 AWS collection needs `boto3`.
 
+## Run it in a cloud shell (no install)
+
+Open Azure Cloud Shell, Google Cloud Shell or AWS CloudShell and run:
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/manojampolu/cloudfinops/master/cloudshell.sh)
+```
+
+It detects the cloud, uses the shell's existing sign-in, runs the read-only assessment and zips the report for
+download. Add `--redact all` for a copy you can share outside the team. See [docs/cloud-shell.md](docs/cloud-shell.md),
+[docs/data-handling.md](docs/data-handling.md) (for security teams) and
+[docs/validation-checklist.md](docs/validation-checklist.md) (first real runs and calibration).
+
 ## Install on another machine
 
 ```bash
@@ -123,6 +136,18 @@ cloudfinops register export --csv register.csv --db runs/register.db
 ```
 
 Three separate numbers: **estimated** (model), **validated** (owner-confirmed) and **realized** (measured).
+
+`cloudfinops register stats` shows how often owners accepted or rejected each rule's findings. Use it to tune noisy
+thresholds, and quote the acceptance rate and validated savings in presales.
+
+### Sharing a report
+
+`--redact` (on `assess` and `demo`) writes a `redacted/` copy of the report, CSVs and mind map:
+- `ids` (the default) replaces subscription/account/project IDs and names, tenant IDs, GUIDs, IPs and emails
+- `all` also replaces resource names, resource groups and owner tags
+
+Pseudonyms are stable, so the report still reads coherently. `redaction-map.csv` maps them back and stays with you.
+At `ids` level, resource names whose names contain the client's name stay visible; use `all` for external sharing.
 
 ### Against your AWS account
 
@@ -247,8 +272,10 @@ src/cloudfinops/
   quality.py          data-quality and coverage checks
   register.py         SQLite savings register (decisions, validated, realized)
   report_html.py      self-contained HTML report
+  redact.py           redacted copies for sharing (--redact ids|all)
   assessment.py       pipeline tying it together
   samples/            AWS CSV/JSON samples; azure/ = a recorded-shape Azure run folder
+cloudshell.sh         one-line runner for Azure / Google / AWS cloud shells
 scripts/              sample data generators
 docs/                 permissions, assessment playbook
 tests/

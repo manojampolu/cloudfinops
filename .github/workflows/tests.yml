@@ -21,3 +21,6 @@ jobs:
       - run: pytest -q
       - run: cloudfinops demo --provider azure --out demo-azure
       - run: cloudfinops demo --provider aws --out demo-aws
+      - name: Cloud Shell script (simulated Azure Cloud Shell)
+        if: runner.os != 'Windows'
+        run: CLOUDFINOPS_HOME="$PWD" CLOUDFINOPS_NO_UPDATE=1 CLOUDFINOPS_RUNS="$RUNNER_TEMP/runs" AZUREPS_HOST_ENVIRONMENT=ci bash cloudshell.sh demo --redact all < /dev/null

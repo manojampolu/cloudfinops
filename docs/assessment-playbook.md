@@ -15,6 +15,10 @@ A bounded, read-only engagement: **Assess → Review with owners → (client imp
 
 ## 2. Run the assessment (30–60 minutes on a typical estate)
 
+Easiest for clients: run it in their own cloud shell ([cloud-shell.md](cloud-shell.md)), so nothing is installed and
+no credentials are shared. Send [data-handling.md](data-handling.md) to their security team beforehand. On the
+first real run in a new cloud, follow [validation-checklist.md](validation-checklist.md).
+
 ```bash
 pip install -e '.[dev]'          # once
 brew install azure-cli           # once; or see https://learn.microsoft.com/cli/azure/install-azure-cli
