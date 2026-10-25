@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from ..config import Config
+from ..harness.errors import is_permission_error, short_error  # noqa: F401  (re-exported)
 from ..harness.runner import CliError, CliRunner
 from ..models import CostRecord, Dataset, Relationship, Resource
 from ..pricing_gcp import FX_TO_USD, machine_memory_gb, machine_type_short, parse_cpu, parse_mem_gib
@@ -124,21 +125,6 @@ def _point_value(p: dict) -> float:
     return 0.0
 
 
-def is_permission_error(msg: str) -> bool:
-    m = msg.lower()
-    return "permission" in m or "(403)" in m or "forbidden" in m
-
-
-def short_error(msg: str) -> str:
-    """First meaningful line of a gcloud / HTTP error, without the echoed command or JSON body."""
-    m = re.search(r'"message":\s*"([^"]+)"', msg)
-    if m:
-        return m.group(1)[:200]
-    m = re.search(r"ERROR: \([^)]*\)\s*(.*)", msg, re.S)
-    text = m.group(1) if m else msg
-    return " ".join(text.split())[:200]
-
-
 def _p95(values: list[float]) -> float:
     vals = sorted(values)
     return vals[min(len(vals) - 1, int(round(0.95 * (len(vals) - 1))))] if vals else 0.0
@@ -236,8 +222,8 @@ class GcpProvider:
             log(f"  skipping {len(no_access)} project(s) this account cannot read: {', '.join(no_access)}")
             manifest["no_access"] = no_access
             manifest["errors"].append({"step": "access", "scope": ", ".join(no_access), "permission": True,
-                                       "message": f"{len(no_access)} project(s) are visible but not readable by this "
-                                                  "account (grant roles/viewer to include them)"})
+                                       "message": f"{len(no_access)} project(s) visible but not readable, not assessed "
+                                                  "(grant roles/viewer to include them)"})
             projects = [p for p in projects if p not in no_access]
             manifest["subscriptions"] = [s for s in scopes if s["id"] not in no_access]
         cfg_project = guard("config", "core/project", lambda: runner.run(

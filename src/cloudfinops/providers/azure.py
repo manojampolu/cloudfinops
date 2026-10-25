@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import statistics
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from ..config import Config
+from ..harness.errors import is_permission_error, short_error
 from ..harness.runner import CliError, CliRunner
 from ..models import CostRecord, Dataset, Relationship, Resource
 from ..pricing_azure import PriceBook, vm_downsize, vm_memory_gb
@@ -170,13 +172,30 @@ class AzureProvider:
             "errors": [],
         }
 
+        def record(step: str, scope: str, exc: Exception) -> None:
+            log(f"  ! {step} ({scope}) failed: {short_error(str(exc))}")
+            manifest["errors"].append({"step": step, "scope": scope, "message": short_error(str(exc)),
+                                       "permission": is_permission_error(str(exc))})
+
         def guard(step: str, scope: str, fn):
             try:
                 return fn()
             except Exception as exc:  # record and keep going: a gap is evidence too
-                log(f"  ! {step} ({scope}) failed: {str(exc)[:200]}")
-                manifest["errors"].append({"step": step, "scope": scope, "message": str(exc)[:1000]})
+                record(step, scope, exc)
                 return None
+
+        names = {s["id"]: s.get("name", s["id"]) for s in scopes}
+        denied: dict[str, dict[str, str]] = defaultdict(dict)  # step -> {subscription: reason}
+
+        deny_lock = threading.Lock()  # metrics workers call deny() concurrently
+
+        def deny(step: str, sub: str, exc: Exception, what: str) -> None:
+            """Record one access gap per subscription and step, instead of one error per call."""
+            with deny_lock:
+                if sub in denied[step]:
+                    return
+                denied[step][sub] = short_error(str(exc))
+            log(f"  ! no {what} access in {names.get(sub, sub)}: skipping the rest of this step there")
 
         log("Collecting inventory (Azure Resource Graph)...")
         resources = guard("inventory", "all", lambda: self._graph(runner, INVENTORY_QUERY, sub_ids)) or []
@@ -184,6 +203,13 @@ class AzureProvider:
         containers = guard("inventory", "containers", lambda: self._graph(runner, CONTAINERS_QUERY, sub_ids)) or []
         runner.save_json("inventory/containers.json", containers)
         log(f"  {len(resources)} resources")
+        visible = defaultdict(int)
+        for r in resources:
+            visible[r.get("subscriptionId", "")] += 1
+        for sub in sub_ids:
+            if resources and not visible.get(sub):
+                denied["inventory"][sub] = ("no resources visible: the subscription is empty, or the identity lacks "
+                                            "Reader at subscription scope (Resource Graph hides what it cannot read)")
 
         log("Collecting costs (Cost Management, amortized)...")
         first_query = True
@@ -193,14 +219,20 @@ class AzureProvider:
                 continue
             for name, grouping in (("by_resource", ["ResourceId", "ServiceName"]),
                                    ("by_pricing_model", ["ServiceName", "PricingModel"])):
+                if sub in denied["costs"]:
+                    break
                 if not first_query and cfg.cost_query_pause_s > 0:
                     log(f"  pausing {cfg.cost_query_pause_s:.0f}s between Cost Management queries (rate limits)")
                     time.sleep(cfg.cost_query_pause_s)
                 first_query = False
-                data = guard("costs", f"{sub}:{name}",
-                             lambda: self._cost_query(runner, token, sub, start, end, grouping))
-                if data is not None:
+                try:
+                    data = self._cost_query(runner, token, sub, start, end, grouping)
                     runner.save_json(f"costs/{sub}_{name}.json", data)
+                except Exception as exc:
+                    if is_permission_error(str(exc)):
+                        deny("costs", sub, exc, "Cost Management")
+                    else:
+                        record("costs", f"{sub}:{name}", exc)
 
         log("Collecting Azure Advisor cost recommendations...")
         for sub in sub_ids:
@@ -219,41 +251,66 @@ class AzureProvider:
         log("Collecting Log Analytics usage...")
         for ws in (r for r in resources if _lower(r.get("type")) == "microsoft.operationalinsights/workspaces"):
             cid = (ws.get("properties") or {}).get("customerId")
-            base = _safe_name(_lower(ws["id"]))
+            base, ws_sub = _safe_name(_lower(ws["id"])), ws.get("subscriptionId", "")
+            calls = []
             if cid:
-                usage = guard("logging", ws["name"], lambda: runner.run(
-                    ["az", "monitor", "log-analytics", "query", "-w", cid, "--analytics-query", LOG_USAGE_QUERY,
-                     "-o", "json"]))
-                if usage is not None:
-                    runner.save_json(f"logging/{base}_usage.json", {"workspace_id": _lower(ws["id"]), "rows": usage})
-            tables = guard("logging", ws["name"], lambda: runner.run(
-                ["az", "monitor", "log-analytics", "workspace", "table", "list", "-g", ws["resourceGroup"],
-                 "--workspace-name", ws["name"], "--subscription", ws["subscriptionId"], "-o", "json"]))
-            if tables is not None:
-                runner.save_json(f"logging/{base}_tables.json", {"workspace_id": _lower(ws["id"]), "tables": tables})
+                calls.append(("usage", ["az", "monitor", "log-analytics", "query", "-w", cid,
+                                        "--analytics-query", LOG_USAGE_QUERY, "-o", "json"]))
+            calls.append(("tables", ["az", "monitor", "log-analytics", "workspace", "table", "list", "-g",
+                                     ws["resourceGroup"], "--workspace-name", ws["name"], "--subscription", ws_sub,
+                                     "-o", "json"]))
+            for kind, cmd in calls:
+                if ws_sub in denied["logging"]:
+                    break
+                try:
+                    out = runner.run(cmd)
+                except Exception as exc:
+                    if is_permission_error(str(exc)):
+                        deny("logging", ws_sub, exc, "Log Analytics")
+                    else:
+                        record("logging", ws["name"], exc)
+                    continue
+                key = "rows" if kind == "usage" else "tables"
+                runner.save_json(f"logging/{base}_{kind}.json", {"workspace_id": _lower(ws["id"]), key: out})
 
         log("Collecting utilization metrics (Azure Monitor)...")
         targets = self._metric_targets(resources, runner.raw_dir, cfg)
         m_end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         m_start = m_end - timedelta(days=cfg.metric_days)
         done = 0
+        skipped = defaultdict(int)
+
+        def fetch(rid, names_, aggs):
+            sub = _sub_of(rid)
+            if sub in denied["metrics"]:
+                skipped[sub] += 1
+                return None
+            try:
+                return self._metrics(runner, rid, names_, m_start, m_end, aggs)
+            except Exception as exc:
+                if is_permission_error(str(exc)):
+                    deny("metrics", sub, exc, "Azure Monitor metrics")  # set in the worker so queued calls skip
+                    return None
+                raise
+
         with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(self._metrics, runner, rid, names, m_start, m_end, aggs): rid
-                       for rid, names, aggs in targets}
+            futures = {pool.submit(fetch, rid, names_, aggs): rid for rid, names_, aggs in targets}
             for fut in as_completed(futures):
                 rid = futures[fut]
                 try:
-                    runner.save_json(f"metrics/{_safe_name(rid)}.json", {"resource_id": rid, "response": fut.result()})
+                    resp = fut.result()
+                    if resp is not None:
+                        runner.save_json(f"metrics/{_safe_name(rid)}.json", {"resource_id": rid, "response": resp})
                 except Exception as exc:
-                    manifest["errors"].append({"step": "metrics", "scope": rid, "message": str(exc)[:500]})
+                    manifest["errors"].append({"step": "metrics", "scope": rid, "message": short_error(str(exc))})
                 done += 1
                 if done % 50 == 0:
                     log(f"  {done}/{len(targets)}")
         manifest["metrics_requested"] = len(targets)
         log(f"  metrics for {len(targets)} resources")
 
-        log("Looking up VM list prices (Azure Retail Prices API)...")
-        book = PriceBook(cache_dir=runner.raw_dir / "prices", online=True)
+        log("Looking up VM list prices (Azure Retail Prices API)..." if cfg.price_lookup else "VM price lookup disabled")
+        book = PriceBook(cache_dir=runner.raw_dir / "prices", online=cfg.price_lookup)
         sizes = set()
         for r in resources:
             if _lower(r.get("type")) == "microsoft.compute/virtualmachines":
@@ -263,9 +320,18 @@ class AzureProvider:
                     if (smaller := vm_downsize(size)):
                         sizes.add((smaller, r.get("location", "")))
         book.prefetch({(size, region) for size, region in sizes})
-        if not book.online:
+        if cfg.price_lookup and not book.online:
             manifest["errors"].append({"step": "prices", "scope": "prices.azure.com",
                                        "message": "Retail Prices API unreachable; fallback price table used"})
+
+        what = {"inventory": "Resource Graph", "costs": "Cost Management (needs Cost Management Reader)",
+                "logging": "Log Analytics (needs Log Analytics Reader)", "metrics": "Azure Monitor metrics (needs Reader)"}
+        for step, subs in denied.items():
+            for sub, reason in subs.items():
+                extra = f"; {skipped[sub]} metric request(s) skipped" if step == "metrics" and skipped.get(sub) else ""
+                manifest["errors"].append({"step": "access", "scope": names.get(sub, sub), "permission": True,
+                                           "message": f"{what[step]}: {reason}{extra}"})
+        manifest["access_gaps"] = {step: sorted(subs) for step, subs in denied.items() if subs}
 
         (runner.run_dir / "scope.json").write_text(json.dumps(manifest, indent=2))
         return manifest
@@ -351,9 +417,9 @@ class AzureProvider:
                                "--start-time", start.isoformat(), "--end-time", end.isoformat(), "-o", "json"])
         try:
             return query(names)
-        except CliError:
-            if len(names) == 1:
-                raise
+        except CliError as exc:
+            if len(names) == 1 or is_permission_error(str(exc)):
+                raise  # one-by-one retry only helps when a single metric is unsupported
         # One unsupported metric (e.g. no guest memory on this VM size) fails the whole call: fetch one by one
         merged, last_error = None, None
         for name in names:
@@ -720,6 +786,11 @@ class AzureProvider:
             if ws in by_id:
                 by_id[ws].attributes["ingest_gb_30d"] = sum(data["tables"].values())
         return dict(usage)
+
+
+def _sub_of(resource_id: str) -> str:
+    m = re.match(r"/subscriptions/([^/]+)", resource_id or "", re.I)
+    return m.group(1) if m else ""
 
 
 def _gib(value) -> float:

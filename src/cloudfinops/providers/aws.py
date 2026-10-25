@@ -15,6 +15,7 @@ import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from ..harness.errors import short_error
 from ..models import CostRecord, Resource
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,30 @@ PURCHASE_TYPE_MAP = {
     "Convertible Reserved Instances": "Commitment-Based", "Dedicated Reserved Instances": "Commitment-Based",
 }
 METRIC_DAYS = 14
+DENIED_CODES = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException",
+                "AuthorizationError", "AuthorizationErrorException", "OptInRequired"}
+_DENIED: set[str] = set()  # services denied during the current collect_inventory() call
+
+
+def _error_code(exc: Exception) -> str:
+    return (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
+
+
+def _is_denied(exc: Exception) -> bool:
+    return _error_code(exc) in DENIED_CODES
+
+
+def _account_id(session) -> str:
+    """Caller account, with a readable error when credentials are missing or expired."""
+    try:
+        return session.client("sts").get_caller_identity()["Account"]
+    except Exception as exc:
+        name = type(exc).__name__
+        if name in ("NoCredentialsError", "PartialCredentialsError") or _error_code(exc) in (
+                "ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException"):
+            raise ValueError("No valid AWS credentials. Run `aws configure` or `aws sso login` "
+                             "(and pass --profile if you use named profiles).") from exc
+        raise
 
 
 def _session(profile: str | None):
@@ -48,7 +73,7 @@ def collect_costs(days: int = 60, group_by: str = "account", profile: str | None
     end = date.today()
     start = end - timedelta(days=days)
     second = GROUP_KEYS[group_by]
-    account_id = session.client("sts").get_caller_identity()["Account"]
+    account_id = _account_id(session)
 
     records, token = [], None
     while True:
@@ -59,7 +84,16 @@ def collect_costs(days: int = 60, group_by: str = "account", profile: str | None
         )
         if token:
             kwargs["NextPageToken"] = token
-        resp = ce.get_cost_and_usage(**kwargs)
+        try:
+            resp = ce.get_cost_and_usage(**kwargs)
+        except Exception as exc:
+            if _is_denied(exc):
+                raise ValueError("Cost Explorer access denied (needs ce:GetCostAndUsage, e.g. the "
+                                 f"AWSBillingReadOnlyAccess policy): {short_error(str(exc))}") from exc
+            if _error_code(exc) == "DataUnavailableException":
+                raise ValueError("Cost Explorer has no data for this account yet. Enable Cost Explorer in the "
+                                 "Billing console; data appears within about 24 hours.") from exc
+            raise
         for period in resp["ResultsByTime"]:
             day = date.fromisoformat(period["TimePeriod"]["Start"])
             for g in period["Groups"]:
@@ -85,12 +119,22 @@ def collect_costs(days: int = 60, group_by: str = "account", profile: str | None
 # --------------------------------------------------------------------------- inventory
 
 def _cw_stats(cw, namespace: str, metric: str, dims: dict[str, str], stats: list[str]) -> dict[str, float] | None:
+    if "cloudwatch" in _DENIED:
+        return None
     end = datetime.now(timezone.utc)
-    resp = cw.get_metric_statistics(
-        Namespace=namespace, MetricName=metric,
-        Dimensions=[{"Name": k, "Value": v} for k, v in dims.items()],
-        StartTime=end - timedelta(days=METRIC_DAYS), EndTime=end, Period=86400, Statistics=stats,
-    )
+    try:
+        resp = cw.get_metric_statistics(
+            Namespace=namespace, MetricName=metric,
+            Dimensions=[{"Name": k, "Value": v} for k, v in dims.items()],
+            StartTime=end - timedelta(days=METRIC_DAYS), EndTime=end, Period=86400, Statistics=stats,
+        )
+    except Exception as exc:
+        if not _is_denied(exc):
+            raise
+        if "cloudwatch" not in _DENIED:  # inventory continues without utilization data
+            log.warning("CloudWatch access denied; continuing without utilization metrics: %s", short_error(str(exc)))
+        _DENIED.add("cloudwatch")
+        return None
     points = resp.get("Datapoints", [])
     if not points:
         return None
@@ -209,13 +253,13 @@ def _s3(session, account: str) -> list[Resource]:
     from botocore.exceptions import ClientError
 
     s3 = session.client("s3")
-    out = []
+    out, skipped = [], []
     for b in s3.list_buckets().get("Buckets", []):
         name = b["Name"]
         try:
             region = s3.get_bucket_location(Bucket=name).get("LocationConstraint") or "us-east-1"
         except ClientError as exc:
-            log.warning("Skipping bucket %s: %s", name, exc)
+            skipped.append((name, short_error(str(exc))))
             continue
         res = Resource(id=name, type="s3_bucket", region=region, account=account)
         try:
@@ -232,13 +276,17 @@ def _s3(session, account: str) -> list[Resource]:
                       ["Maximum"])
         res.attributes["standard_gb"] = round(s["max"] / 1024 ** 3, 2) if s else 0.0
         out.append(res)
+    if skipped:
+        log.warning("Skipped %d bucket(s) that could not be read, e.g. %s: %s", len(skipped), *skipped[0])
     return out
 
 
 def collect_inventory(regions: list[str] | None = None, profile: str | None = None,
-                      include_s3: bool = True) -> list[Resource]:
+                      include_s3: bool = True, gaps: dict | None = None) -> list[Resource]:
+    """Scan regions. A service that is access-denied once is skipped everywhere and reported once in `gaps`."""
     session = _session(profile)
-    account = session.client("sts").get_caller_identity()["Account"]
+    account = _account_id(session)
+    _DENIED.clear()
     if not regions:
         ec2 = session.client("ec2", region_name=session.region_name or "us-east-1")
         regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
@@ -247,14 +295,25 @@ def collect_inventory(regions: list[str] | None = None, profile: str | None = No
     for region in regions:
         log.info("Scanning %s", region)
         for collector in (_ec2, _rds, _elb):
+            svc = collector.__name__.strip("_")
+            if svc in _DENIED:
+                continue
             try:
                 resources += collector(session, region, account)
             except Exception as exc:  # keep scanning other regions/services
-                log.warning("%s in %s failed: %s", collector.__name__.strip("_"), region, exc)
+                if _is_denied(exc):
+                    _DENIED.add(svc)
+                    log.warning("%s access denied; skipping it in all regions: %s", svc, short_error(str(exc)))
+                else:
+                    log.warning("%s in %s failed: %s", svc, region, short_error(str(exc)))
     if include_s3:
         try:
             resources += _s3(session, account)
         except Exception as exc:
-            log.warning("s3 scan failed: %s", exc)
+            if _is_denied(exc):
+                _DENIED.add("s3")
+            log.warning("s3 scan failed: %s", short_error(str(exc)))
+    if gaps is not None:
+        gaps["denied"] = sorted(_DENIED)
     log.info("Collected %d resources", len(resources))
     return resources

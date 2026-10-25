@@ -71,7 +71,8 @@ class Config:
     resource_groups: list[str] = field(default_factory=list)
 
     # Collection / mapping
-    cost_query_pause_s: float = 45.0  # pause between Cost Management queries (limits 429 throttling)
+    cost_query_pause_s: float = 45.0
+    price_lookup: bool = True  # Azure Retail Prices API during collection (public, no credentials)  # pause between Cost Management queries (limits 429 throttling)
     collection_days: int = 60
     metric_days: int = 14
     max_metric_resources: int = 500

@@ -17,6 +17,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[dev]"
+      - run: pip install -e ".[aws,dev]"
       - run: pytest -q
       - run: cloudfinops demo --provider azure --out demo-azure

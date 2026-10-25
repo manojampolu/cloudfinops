@@ -38,3 +38,6 @@ aca_min_monthly_cost = 5.0     # ignore cheaper apps
 
 # Pause between Cost Management queries to avoid 429 throttling (seconds)
 cost_query_pause_s = 45
+
+# Azure: look up VM prices from the public Retail Prices API during collection (false = built-in table only)
+price_lookup = true

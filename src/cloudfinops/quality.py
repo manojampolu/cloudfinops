@@ -9,7 +9,7 @@ from datetime import timedelta
 from .analysis import CostSummary, window
 from .config import Config
 from .models import Dataset
-from .providers.gcp import is_permission_error, short_error
+from .harness.errors import is_permission_error, short_error
 
 METRIC_TYPES = {"azure.vm": "cpu_avg", "azure.app_service_plan": "cpu_avg", "ec2_instance": "cpu_avg_14d",
                 "gcp.vm": "cpu_avg", "azure.container_app": "cpu_avg"}
@@ -34,8 +34,11 @@ def check(ds: Dataset, summary: CostSummary, cfg: Config) -> list[QualityIssue]:
     for step, items in errors.items():
         first = short_error(items[0]["message"])
         if step == "access":
-            out.append(QualityIssue("warn", "access", f"Not assessed: {first}. Projects: {items[0]['scope']}",
-                                    "These projects are excluded from every total and finding."))
+            for item in items[:8]:
+                out.append(QualityIssue("warn", "access", f"Access gap · {item['scope']}: {short_error(item['message'])}",
+                                        "Data behind this gap is missing; related totals and findings are incomplete."))
+            if len(items) > 8:
+                out.append(QualityIssue("warn", "access", f"... and {len(items) - 8} more access gaps (see scope.json)"))
             continue
         denied = sum(1 for i in items if i.get("permission", is_permission_error(i["message"])))
         level = "error" if step in ("inventory", "costs") and denied < len(items) else "warn"

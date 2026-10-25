@@ -156,17 +156,27 @@ def cmd_collect(args) -> int:
     from .providers import aws
 
     out = Path(args.out_dir)
+    failed = False
     if not args.skip_costs:
-        records = aws.collect_costs(days=args.days, group_by=args.group_by, profile=args.profile)
-        write_billing_csv(records, out / "billing.csv")
-        print(f"Wrote {len(records)} cost records to {out / 'billing.csv'}", file=sys.stderr)
+        try:
+            records = aws.collect_costs(days=args.days, group_by=args.group_by, profile=args.profile)
+            write_billing_csv(records, out / "billing.csv")
+            print(f"Wrote {len(records)} cost records to {out / 'billing.csv'}", file=sys.stderr)
+        except ValueError as exc:  # access denied / Cost Explorer not enabled: still collect the inventory
+            print(f"error: costs not collected: {exc}", file=sys.stderr)
+            failed = True
     if not args.skip_inventory:
-        resources = aws.collect_inventory(regions=args.regions, profile=args.profile, include_s3=not args.skip_s3)
+        gaps: dict = {}
+        resources = aws.collect_inventory(regions=args.regions, profile=args.profile, include_s3=not args.skip_s3,
+                                          gaps=gaps)
         write_inventory(resources, out / "inventory.json")
         print(f"Wrote {len(resources)} resources to {out / 'inventory.json'}", file=sys.stderr)
+        if gaps.get("denied"):
+            print(f"Not collected (access denied): {', '.join(gaps['denied'])}. Grant ReadOnlyAccess to include them.",
+                  file=sys.stderr)
     print(f"Next: cloudfinops analyze --billing {out / 'billing.csv'} --inventory {out / 'inventory.json'}",
           file=sys.stderr)
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_rules(args) -> int:
