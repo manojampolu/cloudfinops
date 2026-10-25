@@ -92,9 +92,17 @@ class FakeAws:
         self.calls, self.deny_costs = [], deny_costs
         self.metric_files = []
 
-    def run(self, cmd, save_as=None, parse_json=True, interactive=False):
+    def run(self, cmd, save_as=None, parse_json=True, interactive=False, absent_ok=()):
         check_read_only(cmd)
         self.calls.append(cmd)
+        try:
+            return self._answer(cmd, save_as)
+        except CliError as exc:
+            if any(code in exc.stderr for code in absent_ok):
+                return None
+            raise
+
+    def _answer(self, cmd, save_as):
         words = [w for w in cmd if not w.startswith("--")]
         region = cmd[cmd.index("--region") + 1] if "--region" in cmd else "us-east-1"
         svc, op = cmd[1], cmd[2]
@@ -154,3 +162,32 @@ def test_estate_map_does_not_double_count_service_level_billing(tmp_path):
     account = result.tree.children[0]
     assert not any(c.kind == "unmapped" for c in account.children)
     assert result.tree.cost == pytest.approx(sum(r.monthly_cost or 0 for r in result.dataset.resources))
+
+
+def test_not_configured_answers_are_not_failures(tmp_path, monkeypatch):
+    """NoSuchTagSet / NoSuchLifecycleConfiguration are normal answers: logged as exit 0, returned as None."""
+    import os
+    import stat
+    import sys
+    from cloudfinops.harness.runner import CliRunner
+    if sys.platform == "win32":
+        pytest.skip("uses a POSIX shell script as a fake aws")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "aws"
+    fake.write_text("#!/bin/sh\necho 'An error occurred (NoSuchTagSet) when calling the GetBucketTagging operation' >&2\nexit 254\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    runner = CliRunner(tmp_path / "run")
+    assert runner.run(["aws", "s3api", "get-bucket-tagging", "--bucket", "b"], absent_ok=("NoSuchTagSet",)) is None
+    entry = json.loads((tmp_path / "run/commands.log").read_text().splitlines()[0])
+    assert entry["exit"] == 0 and entry["result"] == "not configured"
+    with pytest.raises(CliError):  # without absent_ok it is still an error
+        runner.run(["aws", "s3api", "get-bucket-tagging", "--bucket", "b"])
+
+
+def test_billing_note_when_cost_explorer_denied(tmp_path):
+    runner = FakeAws(tmp_path)
+    manifest = AwsProvider().collect(runner, [{"id": "444455556666", "name": "acme-workloads"}],
+                                     Config(aws_regions=["us-east-1"]), log=lambda *_: None)
+    assert manifest["billing_note"].startswith("Cost Explorer access denied")
