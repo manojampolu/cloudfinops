@@ -113,6 +113,15 @@ def cmd_assess(args) -> int:
     return _assess_run_dir(run_dir, run_dir, args, register=register)
 
 
+def cmd_check(args) -> int:
+    from .harness.check import run_check
+
+    cfg = _apply_args(Config.load(args.config), args)
+    report = run_check(args.provider, cfg, args.scopes)
+    print(report.render())
+    return 0 if report.ready else 1
+
+
 def cmd_register(args) -> int:
     from .register import Register
 
@@ -262,6 +271,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lookback-days", type=int)
     p.add_argument("--disable", nargs="*", metavar="RULE_ID")
     p.set_defaults(func=cmd_assess)
+
+    p = sub.add_parser("check", help="quick readiness check: CLI, sign-in and read access per data source")
+    p.add_argument("--provider", choices=["aws", "azure", "gcp"], default="azure")
+    p.add_argument("--subscriptions", "--projects", dest="scopes", nargs="*",
+                   help="azure subscriptions / gcp projects to check (default: all enabled / billing-linked)")
+    p.add_argument("--profile", help="aws: named CLI profile")
+    p.add_argument("--regions", nargs="*", help="aws: region to probe (first one is used)")
+    p.add_argument("--config", help="TOML file (e.g. aws_profile, gcp_billing_table)")
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("register", help="savings register: track decisions, validated and realized savings")
     p.add_argument("action", choices=["list", "update", "verify", "export", "stats"])
