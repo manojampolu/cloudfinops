@@ -191,3 +191,21 @@ def test_billing_note_when_cost_explorer_denied(tmp_path):
     manifest = AwsProvider().collect(runner, [{"id": "444455556666", "name": "acme-workloads"}],
                                      Config(aws_regions=["us-east-1"]), log=lambda *_: None)
     assert manifest["billing_note"].startswith("Cost Explorer access denied")
+
+
+def test_malformed_static_key_is_caught_locally(tmp_path, monkeypatch):
+    from cloudfinops.harness.check import run_check
+    from cloudfinops.providers.aws_cli import local_key_problem
+    creds = tmp_path / "credentials"
+    creds.write_text("[good]\naws_access_key_id = AKIAABCDEFGHIJKLMNOP\naws_secret_access_key = " + "x" * 40 + "\n"
+                     "[bad]\naws_access_key_id = cloudfinops readonly paste\naws_secret_access_key = not a secret\n")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(creds))
+    assert local_key_problem("good") is None and local_key_problem("missing") is None
+    problem = local_key_problem("bad")
+    assert "not a valid AWS key" in problem and "not a secret" not in problem  # never echoes the secret
+    with pytest.raises(CliError, match="not a valid AWS key"):
+        AwsProvider(Config(aws_profile="bad")).ensure_login(runner=None)
+    from cloudfinops.harness.runner import CliRunner
+    monkeypatch.setattr(CliRunner, "available", staticmethod(lambda b: True))
+    report = run_check("aws", Config(aws_profile="bad"))
+    assert not report.ready and any(p.name == "Credentials" and p.status == "MISSING" for p in report.probes)
