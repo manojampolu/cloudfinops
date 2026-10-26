@@ -115,8 +115,12 @@ class CliRunner:
             fh.write(json.dumps(entry) + "\n")
 
     def run(self, cmd: list[str], save_as: str | None = None, parse_json: bool = True,
-            interactive: bool = False):
-        """Execute a read-only command. Returns parsed JSON (or text) and optionally saves raw output."""
+            interactive: bool = False, absent_ok: tuple[str, ...] = ()):
+        """Execute a read-only command. Returns parsed JSON (or text) and optionally saves raw output.
+
+        absent_ok: error codes that mean "not configured" (e.g. NoSuchTagSet). They return None and are logged
+        as a normal answer, not a failure.
+        """
         check_read_only(cmd)
         exe = shutil.which(cmd[0])  # on Windows the CLIs are az.cmd / gcloud.cmd, not launchable by bare name
         cmd_exec = [exe, *cmd[1:]] if exe else cmd
@@ -143,9 +147,13 @@ class CliRunner:
             duration = round(time.monotonic() - started, 2)
             throttled = proc.returncode != 0 and any(
                 s in stderr for s in ("429", "TooManyRequests", "Throttl", "RateExceeded"))
+            absent = proc.returncode != 0 and any(code in stderr for code in absent_ok)
             self._log({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                       "cmd": shlex.join(cmd), "exit": proc.returncode, "duration_s": duration,
-                       "output": save_as or "", "bytes": len(stdout), "attempt": attempt + 1})
+                       "cmd": shlex.join(cmd), "exit": 0 if absent else proc.returncode, "duration_s": duration,
+                       "output": save_as or "", "bytes": len(stdout), "attempt": attempt + 1,
+                       **({"result": "not configured"} if absent else {})})
+            if absent:
+                return None
             if throttled and attempt < self.retries:
                 attempt += 1
                 time.sleep(delay)

@@ -66,6 +66,35 @@ WHAT = {"costs": "Cost Explorer (needs AWSBillingReadOnlyAccess / ce:GetCostAndU
         "s3": "S3 bucket details"}
 
 
+def local_key_problem(profile: str = "") -> str | None:
+    """Spot an obviously malformed static access key in ~/.aws/credentials before calling AWS.
+
+    Returns a readable problem description, or None (fine, or not a static-key profile). Never returns the secret.
+    """
+    import configparser
+    import os
+
+    path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE") or os.path.expanduser("~/.aws/credentials")
+    name = profile or os.environ.get("AWS_PROFILE") or "default"
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path)
+    except configparser.Error:
+        return None
+    if name not in parser:
+        return None
+    key = parser[name].get("aws_access_key_id", "").strip()
+    secret = parser[name].get("aws_secret_access_key", "").strip()
+    if not key and not secret:
+        return None
+    if not re.fullmatch(r"(AKIA|ASIA)[A-Z0-9]{16}", key) or len(secret) != 40 or " " in secret:
+        return (f"The access key stored for profile '{name}' is not a valid AWS key (expected an access key ID of "
+                f"20 characters starting AKIA and a 40-character secret; found {len(key)} and {len(secret)} characters). "
+                f"Run `aws configure --profile {name}` and paste the values from IAM > Security credentials > "
+                "Create access key.")
+    return None
+
+
 def _tags(tag_list) -> dict[str, str]:
     return {str(t.get("Key", "")).lower(): str(t.get("Value", "")) for t in (tag_list or [])}
 
@@ -102,6 +131,9 @@ class AwsProvider:
         return []
 
     def ensure_login(self, runner: CliRunner, device_code: bool = False, tenant: str | None = None) -> dict:
+        problem = local_key_problem(self.profile)
+        if problem:
+            raise CliError(["aws", "sts", "get-caller-identity"], 1, problem)
         try:
             ident = runner.run(self._aws("sts", "get-caller-identity"))
         except CliError as exc:
@@ -201,6 +233,11 @@ class AwsProvider:
         for step, reason in denied.items():
             manifest["errors"].append({"step": "access", "scope": scopes[0]["name"], "permission": True,
                                        "message": f"{WHAT.get(step, step)}: {reason}"})
+        if not (runner.raw_dir / "costs" / "ce_service_region.json").exists() and not cfg.aws_billing_csv:
+            why = ("Cost Explorer access denied" if "costs" in denied else
+                   "Cost Explorer returned no data (it may not be enabled for this account yet)")
+            manifest["billing_note"] = (f"{why}, so spend is unknown. Grant ce:GetCostAndUsage (AWSBillingReadOnlyAccess) "
+                                        "to this identity, or pass a CUR / billing CSV export with --billing-csv.")
         manifest["access_gaps"] = sorted(denied)
         (runner.run_dir / "scope.json").write_text(json.dumps(manifest, indent=2))
         return manifest
@@ -272,14 +309,16 @@ class AwsProvider:
             region = loc.get("LocationConstraint") or "us-east-1"
             out = {"name": name, "region": region, "created": b.get("CreationDate"), "has_lifecycle": False, "tags": {}}
             try:
-                runner.run(self._aws("s3api", "get-bucket-lifecycle-configuration", "--bucket", name))
-                out["has_lifecycle"] = True
-            except CliError as exc:  # NoSuchLifecycleConfiguration = no policy; access denied = unknown
-                out["has_lifecycle"] = None if is_permission_error(str(exc)) else False
+                rules = runner.run(self._aws("s3api", "get-bucket-lifecycle-configuration", "--bucket", name),
+                                   absent_ok=("NoSuchLifecycleConfiguration",))
+                out["has_lifecycle"] = bool(rules)
+            except CliError:  # access denied or other failure: unknown, never "no policy"
+                out["has_lifecycle"] = None
             try:
-                out["tags"] = _tags((runner.run(self._aws("s3api", "get-bucket-tagging", "--bucket", name)) or {}).get("TagSet"))
+                tags = runner.run(self._aws("s3api", "get-bucket-tagging", "--bucket", name), absent_ok=("NoSuchTagSet",))
+                out["tags"] = _tags((tags or {}).get("TagSet"))
             except CliError:
-                pass  # NoSuchTagSet
+                pass
             return out
 
         with ThreadPoolExecutor(max_workers=8) as pool:

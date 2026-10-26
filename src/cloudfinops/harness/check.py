@@ -105,6 +105,11 @@ def _check_aws(runner: CliRunner, report: CheckReport, cfg, scopes: list[str]) -
         report.add("AWS CLI", MISSING, "not installed", "brew install awscli (or see docs/permissions.md)", critical=True)
         return
     report.add("AWS CLI", OK, "installed")
+    from ..providers.aws_cli import local_key_problem
+    problem = local_key_problem(cfg.aws_profile)
+    if problem:
+        report.add("Credentials", MISSING, problem.split(" (expected")[0], problem.split(". ", 1)[-1], critical=True)
+        return
     ident = _probe(report, "Signed in", lambda: aws("sts", "get-caller-identity"),
                    "Run `aws configure` or `aws sso login` (add --profile <name> for named profiles)", critical=True,
                    ok_detail=lambda r: f"{r.get('Arn')} (account {r.get('Account')})")
